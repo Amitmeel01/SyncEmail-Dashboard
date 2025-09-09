@@ -355,7 +355,7 @@ app.get('/api/auth/google', (req, res) => {
 
 app.get('/api/auth/google/callback', async (req, res) => {
     const { code, state } = req.query;
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl = process.env.FRONTEND_URL || "https://sync-email-dashboard.vercel.app/";
 
     try {
         if (req.query.error || !code) {
