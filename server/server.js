@@ -1,7 +1,3 @@
-/*
- * Enhanced Email Sync & Analytics Hub - Backend
- * Fixed connection pooling, OAuth2, and email processing
- */
 
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
@@ -25,7 +21,7 @@ const mongoUri = process.env.MONGO_URI
 const oauth2Client = new google.auth.OAuth2(
     process.env.CLIENT_ID,
     process.env.CLIENT_SECRET,
-    process.env.GOOGLE_CALLBACK_URL || "http://localhost:3001/api/auth/google/callback"
+    process.env.GOOGLE_CALLBACK_URL
 );
 
 // --- MIDDLEWARE ---
