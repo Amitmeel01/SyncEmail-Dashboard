@@ -1,0 +1,26 @@
+{
+  "name": "assignment",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "generic-pool": "^3.9.0",
+    "googleapis": "^159.0.0",
+    "imap-simple": "^5.1.0",
+    "mailparser": "^3.7.4",
+    "mongodb": "^6.19.0",
+    "mongoose": "^8.18.1",
+    "nodemon": "^3.1.10",
+    "uuid": "^12.0.0"
+  }
+}
