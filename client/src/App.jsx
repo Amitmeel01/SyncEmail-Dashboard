@@ -104,16 +104,17 @@ export default function App() {
         }
     }, []);
     
-    const fetchJobStatus = useCallback(async () => {
-        try {
-            const response = await fetch(`${API_URL}/api/sync/status`);
-            if (!response.ok) throw new Error('Failed to fetch jobs');
-            const data = await response.json();
-            setJobs(data);
-        } catch (error) { 
-            console.error("Error fetching job statuses:", error);
-        }
-    }, []);
+ const fetchJobStatus = useCallback(async () => {
+    try {
+        // Change from /api/sync/status to /api/status to match backend
+        const response = await fetch(`${API_URL}/api/status`);
+        if (!response.ok) throw new Error('Failed to fetch jobs');
+        const data = await response.json();
+        setJobs(data);
+    } catch (error) { 
+        console.error("Error fetching job statuses:", error);
+    }
+}, []);
 
     const fetchEmails = useCallback(async () => {
         try {
@@ -158,6 +159,34 @@ export default function App() {
     }, [fetchAccounts, fetchJobStatus, fetchEmails, fetchStats, activeTab]);
 
     useEffect(() => {
+    // Handle OAuth callback messages
+    const handleMessage = (event) => {
+        if (event.data === 'oauth_success') {
+            fetchAccounts();
+        }
+    };
+    
+    window.addEventListener('message', handleMessage);
+    
+    // Also check URL parameters for OAuth results
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('auth_success') === 'true') {
+        alert('Google authentication successful! Your account has been added.');
+        fetchAccounts();
+        // Clean up URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (urlParams.get('error')) {
+        alert(`Authentication error: ${decodeURIComponent(urlParams.get('error'))}`);
+        // Clean up URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    
+    return () => {
+        window.removeEventListener('message', handleMessage);
+    };
+}, [fetchAccounts]);
+
+    useEffect(() => {
         if (searchTerm === '') {
             setFilteredEmails(emails);
         } else {
@@ -172,35 +201,42 @@ export default function App() {
     }, [searchTerm, emails]);
 
     // --- Event Handlers ---
-    const handleAddAccount = async (e) => {
-        e.preventDefault();
-        setIsLoading(true);
+ const handleAddAccount = async (e) => {
+    e.preventDefault();
+    setIsLoading(true);
+    
+    const formData = new FormData(e.target);
+    const accountData = Object.fromEntries(formData.entries());
+    
+    // Fix: Change 'pass' to 'password' to match backend expectation
+    if (accountData.pass) {
+        accountData.password = accountData.pass;
+        delete accountData.pass;
+    }
+    
+    try {
+        const response = await fetch(`${API_URL}/api/accounts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(accountData),
+        });
         
-        const formData = new FormData(e.target);
-        const accountData = Object.fromEntries(formData.entries());
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message);
         
-        try {
-            const response = await fetch(`${API_URL}/api/accounts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(accountData),
-            });
-            
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.message);
-            
-            await fetchAccounts();
-            setIsModalOpen(false);
-            e.target.reset();
-            
-            // Show success message
-            alert('Account added successfully! You can now process its emails.');
-        } catch (err) {
-            alert(`Error: ${err.message}`);
-        } finally {
-            setIsLoading(false);
-        }
-    };
+        await fetchAccounts();
+        setIsModalOpen(false);
+        e.target.reset();
+        
+        // Show success message
+        alert('Account added successfully! You can now process its emails.');
+    } catch (err) {
+        alert(`Error: ${err.message}`);
+    } finally {
+        setIsLoading(false);
+    }
+};
+
     
     const handleGoogleAuth = () => {
         const authUrl = `${API_URL}/api/auth/google`;
@@ -426,120 +462,120 @@ export default function App() {
     );
 
     const renderJobs = () => (
-        <div className="space-y-6">
-            <div className="flex justify-between items-center">
-                <h2 className="text-2xl font-bold">Processing Jobs</h2>
-                <div className="text-sm text-gray-600">
-                    Active: {jobs.filter(j => j.status === 'running').length} | 
-                    Total: {jobs.length}
-                </div>
+    <div className="space-y-6">
+        <div className="flex justify-between items-center">
+            <h2 className="text-2xl font-bold">Processing Jobs</h2>
+            <div className="text-sm text-gray-600">
+                Active: {jobs.filter(j => j.status === 'running').length} | 
+                Total: {jobs.length}
             </div>
+        </div>
 
-            {/* Sync Job Creator */}
-            <div className="bg-white p-6 rounded-lg shadow-md">
-                <h3 className="text-lg font-semibold mb-4">Start Email Sync</h3>
-                <form onSubmit={handleStartSync} className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <select name="sourceAccountId" required className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500">
-                            <option value="">Select Source Account</option>
-                            {accounts.map(a => <option key={a._id} value={a._id}>{a.user}</option>)}
-                        </select>
-                        <select name="destAccountId" required className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500">
-                            <option value="">Select Destination Account</option>
-                            {accounts.map(a => <option key={a._id} value={a._id}>{a.user}</option>)}
-                        </select>
-                    </div>
-                    <button 
-                        type="submit" 
-                        className="w-full bg-purple-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-purple-700 transition-colors"
-                    >
-                        Start Sync Job
-                    </button>
-                </form>
-            </div>
-
-            {/* Jobs List */}
-            <div className="space-y-4">
-                {jobs.map(job => (
-                    <div key={job.id} className="bg-white p-6 rounded-lg shadow-md">
-                        <div className="flex justify-between items-start mb-4">
-                            <div>
-                                <div className="flex items-center gap-3 mb-2">
-                                    <h3 className="font-semibold">
-                                        {job.type === 'process' ? 'Email Processing' : 'Email Sync'} 
-                                        #{job.id.substring(0, 8)}
-                                    </h3>
-                                    <StatusBadge status={job.status} />
-                                </div>
-                                
-                                {job.type === 'sync' ? (
-                                    <p className="text-sm text-gray-600">
-                                        {accounts.find(a => a._id === job.sourceAccountId)?.user || 'Unknown'} 
-                                        {' → '}
-                                        {accounts.find(a => a._id === job.destAccountId)?.user || 'Unknown'}
-                                    </p>
-                                ) : (
-                                    <p className="text-sm text-gray-600">
-                                        Processing: {accounts.find(a => a._id === job.accountId)?.user || 'Unknown'}
-                                    </p>
-                                )}
-                                
-                                <p className="text-xs text-gray-500 mt-1">
-                                    Started: {new Date(job.createdAt).toLocaleString()}
-                                </p>
+        {/* Jobs List with better error handling */}
+        <div className="space-y-4">
+            {jobs.map(job => (
+                <div key={job.id} className="bg-white p-6 rounded-lg shadow-md border-l-4 border-indigo-500">
+                    <div className="flex justify-between items-start mb-4">
+                        <div className="flex-1">
+                            <div className="flex items-center gap-3 mb-2">
+                                <h3 className="font-semibold">
+                                    {job.type === 'process' ? '📧 Email Processing' : '🔄 Email Sync'} 
+                                    <span className="text-gray-500 text-sm ml-2">#{job.id.substring(0, 8)}</span>
+                                </h3>
+                                <StatusBadge status={job.status} />
                             </div>
                             
-                            <div className="flex gap-2">
-                                {job.status === 'running' && (
-                                    <button 
-                                        onClick={() => handleJobAction(job.id, 'pause')}
-                                        className="text-xs bg-yellow-500 text-white font-bold py-1 px-3 rounded hover:bg-yellow-600 transition-colors"
-                                    >
-                                        Pause
-                                    </button>
-                                )}
-                                {job.status === 'paused' && (
-                                    <button 
-                                        onClick={() => handleJobAction(job.id, 'resume')}
-                                        className="text-xs bg-blue-500 text-white font-bold py-1 px-3 rounded hover:bg-blue-600 transition-colors"
-                                    >
-                                        Resume
-                                    </button>
+                            {job.type === 'sync' ? (
+                                <p className="text-sm text-gray-600">
+                                    {accounts.find(a => a._id === job.sourceAccountId)?.user || 'Unknown'} 
+                                    <span className="mx-2">→</span>
+                                    {accounts.find(a => a._id === job.destAccountId)?.user || 'Unknown'}
+                                </p>
+                            ) : (
+                                <p className="text-sm text-gray-600">
+                                    Processing: {accounts.find(a => a._id === job.accountId)?.user || 'Unknown'}
+                                </p>
+                            )}
+                            
+                            <div className="flex gap-4 text-xs text-gray-500 mt-2">
+                                <span>Started: {new Date(job.createdAt).toLocaleString()}</span>
+                                {job.duration && (
+                                    <span>Duration: {Math.round(job.duration / 1000)}s</span>
                                 )}
                             </div>
                         </div>
                         
-                        <div className="space-y-2">
-                            <ProgressBar 
-                                current={job.progress.processed} 
-                                total={job.progress.total} 
-                            />
-                            
-                            {job.progress.currentFolder && (
-                                <p className="text-xs text-gray-600">
-                                    Current folder: {job.progress.currentFolder}
-                                </p>
+                        <div className="flex gap-2">
+                            {job.status === 'running' && (
+                                <button 
+                                    onClick={() => handleJobAction(job.id, 'pause')}
+                                    className="text-xs bg-yellow-500 text-white font-bold py-1 px-3 rounded hover:bg-yellow-600 transition-colors"
+                                >
+                                    ⏸ Pause
+                                </button>
                             )}
-                            
-                            {job.error && (
-                                <p className="text-xs text-red-600 bg-red-50 p-2 rounded">
-                                    Error: {job.error}
-                                </p>
+                            {job.status === 'paused' && (
+                                <button 
+                                    onClick={() => handleJobAction(job.id, 'resume')}
+                                    className="text-xs bg-blue-500 text-white font-bold py-1 px-3 rounded hover:bg-blue-600 transition-colors"
+                                >
+                                    ▶ Resume
+                                </button>
                             )}
                         </div>
                     </div>
-                ))}
-            </div>
-
-            {jobs.length === 0 && (
-                <div className="text-center py-12">
-                    <div className="text-gray-400 text-6xl mb-4">⚡</div>
-                    <h3 className="text-xl font-medium text-gray-900 mb-2">No Active Jobs</h3>
-                    <p className="text-gray-600">Process emails from your accounts or start a sync job</p>
+                    
+                    <div className="space-y-3">
+                        <ProgressBar 
+                            current={job.progress.processed || 0} 
+                            total={job.progress.total || 0} 
+                        />
+                        
+                        {job.progress.currentFolder && (
+                            <div className="text-xs text-gray-600 bg-gray-50 px-3 py-2 rounded">
+                                📁 Current folder: <span className="font-mono">{job.progress.currentFolder}</span>
+                            </div>
+                        )}
+                        
+                        {job.progress.errors > 0 && (
+                            <div className="text-xs text-orange-600 bg-orange-50 px-3 py-2 rounded">
+                                ⚠ {job.progress.errors} errors encountered
+                            </div>
+                        )}
+                        
+                        {job.error && (
+                            <div className="text-xs text-red-600 bg-red-50 p-3 rounded border border-red-200">
+                                <strong>Error:</strong> {job.error}
+                            </div>
+                        )}
+                        
+                        {job.status === 'completed' && (
+                            <div className="text-xs text-green-600 bg-green-50 px-3 py-2 rounded">
+                                ✅ Completed successfully! Processed {job.progress.processed} items.
+                            </div>
+                        )}
+                    </div>
                 </div>
-            )}
+            ))}
         </div>
-    );
+
+        {jobs.length === 0 && (
+            <div className="text-center py-12 bg-white rounded-lg shadow-sm">
+                <div className="text-gray-400 text-6xl mb-4">⚡</div>
+                <h3 className="text-xl font-medium text-gray-900 mb-2">No Active Jobs</h3>
+                <p className="text-gray-600 mb-4">Process emails from your accounts or start a sync job</p>
+                <div className="flex justify-center gap-3">
+                    <button 
+                        onClick={() => setActiveTab('accounts')}
+                        className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors"
+                    >
+                        Go to Accounts
+                    </button>
+                </div>
+            </div>
+        )}
+    </div>
+);
 
     const renderEmails = () => (
         <div className="space-y-6">
@@ -752,13 +788,13 @@ export default function App() {
                                     <label className="block text-sm font-medium text-gray-700 mb-1">
                                         Password
                                     </label>
-                                    <input 
-                                        type="password" 
-                                        name="pass" 
-                                        required 
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500"
-                                        placeholder="App password or regular password"
-                                    />
+                                   <input 
+    type="password" 
+    name="password"  // ✅ Correct - matches backend
+    required 
+    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500"
+    placeholder="App password or regular password"
+/>
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-4">
