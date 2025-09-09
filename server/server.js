@@ -1,3 +1,4 @@
+
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const imaps = require('imap-simple');
@@ -15,23 +16,20 @@ dotenv.config();
 // --- CONFIGURATION ---
 const app = express();
 const port = process.env.PORT || 3001;
-const mongoUri = process.env.MONGO_URI || 'mongodb+srv://amitmeel:meelamit3838@cluster0.klncho3.mongodb.net/emailTask?retryWrites=true&w=majority&appName=Cluster0';
+const mongoUri = process.env.MONGO_URI;
 
 const oauth2Client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3001/api/auth/google/callback'
+    process.env.CLIENT_ID,
+    process.env.CLIENT_SECRET,
+    process.env.GOOGLE_CALLBACK_URL
 );
 
 // --- MIDDLEWARE ---
 app.use(express.json());
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
     next();
 });
 
@@ -46,11 +44,11 @@ const encrypt = (text) => Buffer.from(text).toString('base64');
 const decrypt = (text) => Buffer.from(text, 'base64').toString('ascii');
 
 /**
- * Construct the XOAUTH2 SASL token
+ * Constructs proper XOAUTH2 SASL token for Gmail authentication
  */
 const constructXOAuth2Token = (user, accessToken) => {
-    const authString = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
-    return Buffer.from(authString).toString('base64');
+    const auth_string = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
+    return Buffer.from(auth_string).toString('base64');
 };
 
 // --- ENHANCED IMAP CONNECTION POOL ---
@@ -58,6 +56,7 @@ async function refreshOAuth2Token(account) {
     if (!account.refreshToken) {
         throw new Error('No refresh token available. Re-authentication is required.');
     }
+    
     try {
         console.log(`Refreshing OAuth2 token for ${account.user}`);
         oauth2Client.setCredentials({ refresh_token: account.refreshToken });
@@ -68,34 +67,52 @@ async function refreshOAuth2Token(account) {
         
         await db.collection('accounts').updateOne(
             { _id: account._id },
-            { $set: { accessToken: account.accessToken, tokenExpiry: account.tokenExpiry } }
+            { 
+                $set: { 
+                    accessToken: account.accessToken, 
+                    tokenExpiry: account.tokenExpiry,
+                    authStatus: 'valid',
+                    lastError: null
+                } 
+            }
         );
+        
         console.log(`✓ Token refreshed for ${account.user}`);
         return account;
     } catch (error) {
         console.error(`✗ Failed to refresh token for ${account.user}:`, error.response?.data || error.message);
+        
         await db.collection('accounts').updateOne(
             { _id: account._id },
-            { $set: { authStatus: 'invalid', lastError: 'Token refresh failed. Please re-authenticate.' } }
+            { 
+                $set: { 
+                    authStatus: 'invalid', 
+                    lastError: 'Token refresh failed. Please re-authenticate.' 
+                } 
+            }
         );
-        throw new Error('Token refresh failed.');
+        throw new Error('Token refresh failed. Please re-authenticate.');
     }
 }
 
 function createPoolForAccount(account) {
-    if (connectionPools.has(account._id.toString())) {
-        return connectionPools.get(account._id.toString());
+    const poolKey = account._id.toString();
+    
+    if (connectionPools.has(poolKey)) {
+        return connectionPools.get(poolKey);
     }
 
     const factory = {
         create: async () => {
-            console.log(`Creating connection for ${account.user}`);
+            console.log(`Creating IMAP connection for ${account.user}`);
             
             let currentAccount = { ...account };
 
+            // Handle OAuth2 token refresh
             if (currentAccount.authType === 'XOAUTH2') {
                 const now = new Date();
                 const expiry = new Date(currentAccount.tokenExpiry);
+                
                 if (now >= new Date(expiry.getTime() - 5 * 60 * 1000)) {
                     currentAccount = await refreshOAuth2Token(currentAccount);
                 }
@@ -106,8 +123,8 @@ function createPoolForAccount(account) {
                     host: currentAccount.host,
                     port: currentAccount.port,
                     tls: true,
-                    authTimeout: 25000,
-                    connTimeout: 25000,
+                    authTimeout: 30000,
+                    connTimeout: 30000,
                     tlsOptions: { 
                         rejectUnauthorized: false,
                         servername: currentAccount.host
@@ -125,50 +142,73 @@ function createPoolForAccount(account) {
 
             try {
                 const connection = await imaps.connect(config);
-                console.log(`✓ Connection established for ${currentAccount.user}`);
+                console.log(`✓ IMAP connection established for ${currentAccount.user}`);
+                
+                // Update account status on successful connection
                 await db.collection('accounts').updateOne(
                     { _id: currentAccount._id }, 
-                    { $set: { authStatus: 'valid', lastError: null } }
+                    { 
+                        $set: { 
+                            authStatus: 'valid', 
+                            lastError: null,
+                            lastConnected: new Date()
+                        } 
+                    }
                 );
+                
                 return connection;
             } catch (error) {
-                console.error(`✗ Failed to create connection for ${currentAccount.user}:`, error.message);
+                console.error(`✗ Failed to create IMAP connection for ${currentAccount.user}:`, error.message);
+                
+                // Update account status on failed connection
                 await db.collection('accounts').updateOne(
                     { _id: currentAccount._id }, 
-                    { $set: { authStatus: 'error', lastError: error.message } }
+                    { 
+                        $set: { 
+                            authStatus: 'error', 
+                            lastError: error.message,
+                            lastErrorAt: new Date()
+                        } 
+                    }
                 );
+                
                 throw error;
             }
         },
         destroy: (connection) => {
-            if (connection && typeof connection.end === 'function') {
-                connection.end();
+            try {
+                if (connection && connection.state !== 'disconnected') {
+                    connection.end();
+                    console.log(`Connection destroyed for ${connection._config?.user || 'unknown'}`);
+                }
+            } catch (error) {
+                console.error('Error destroying connection:', error.message);
             }
-        },
-        validate: (connection) => {
-            return connection && connection.state !== 'disconnected';
         }
     };
 
     const pool = genericPool.createPool(factory, {
         min: 0,
         max: 3,
-        acquireTimeoutMillis: 30000,
-        idleTimeoutMillis: 30000,
-        evictionRunIntervalMillis: 10000,
+        acquireTimeoutMillis: 45000,
+        createTimeoutMillis: 45000,
+        destroyTimeoutMillis: 5000,
+        idleTimeoutMillis: 300000, // 5 minutes
     });
     
     pool.on('factoryCreateError', (err) => {
         console.error(`Pool factory error for ${account.user}:`, err.message);
     });
 
-    connectionPools.set(account._id.toString(), pool);
+    connectionPools.set(poolKey, pool);
     return pool;
 }
 
 async function withConnection(accountId, callback) {
     const account = await db.collection('accounts').findOne({ _id: new ObjectId(accountId) });
-    if (!account) throw new Error("Account not found");
+    if (!account) {
+        throw new Error("Account not found");
+    }
 
     if (account.authStatus === 'invalid') {
         throw new Error(`Authentication for ${account.user} is invalid. Please re-authenticate.`);
@@ -180,9 +220,16 @@ async function withConnection(accountId, callback) {
     try {
         connection = await pool.acquire();
         return await callback(connection);
+    } catch (error) {
+        console.error(`Error in withConnection for ${account.user}:`, error.message);
+        throw error;
     } finally {
         if (connection) {
-            await pool.release(connection);
+            try {
+                await pool.release(connection);
+            } catch (releaseError) {
+                console.error('Error releasing connection:', releaseError.message);
+            }
         }
     }
 }
@@ -190,31 +237,39 @@ async function withConnection(accountId, callback) {
 // --- EMAIL ANALYTICS FUNCTIONS ---
 async function detectESP(fromAddress, headers) {
     const domain = fromAddress.split('@')[1] || 'unknown.com';
+    
     const espPatterns = {
         'Gmail': ['gmail.com', 'googlemail.com'],
-        'Outlook': ['outlook.com', 'hotmail.com', 'live.com'],
-        'Yahoo': ['yahoo.com', 'ymail.com'],
+        'Outlook': ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'],
+        'Yahoo': ['yahoo.com', 'ymail.com', 'rocketmail.com'],
         'Amazon SES': ['amazonses.com'],
-        'SendGrid': ['sendgrid.net'],
-        'Mailchimp': ['mailchimp.com'],
-        'Constant Contact': ['constantcontact.com']
+        'SendGrid': ['sendgrid.net', 'sendgrid.com'],
+        'Mailchimp': ['mailchimp.com', 'mcsv.net'],
+        'Constant Contact': ['constantcontact.com'],
+        'Campaign Monitor': ['createsend.com'],
+        'Mailgun': ['mailgun.org', 'mg.domain.com']
     };
 
+    // Check domain patterns first
     for (const [esp, domains] of Object.entries(espPatterns)) {
-        if (domains.some(d => domain.includes(d))) return esp;
+        if (domains.some(d => domain.includes(d) || d.includes(domain))) {
+            return esp;
+        }
     }
 
-    const receivedHeaders = Array.isArray(headers.get('received')) ? 
-        headers.get('received') : 
-        [headers.get('received')];
-    
-    for (const received of receivedHeaders) {
-        if (!received) continue;
-        if (received.includes('gmail.com')) return 'Gmail';
-        if (received.includes('outlook.com')) return 'Outlook';
-        if (received.includes('yahoo.com')) return 'Yahoo';
-        if (received.includes('amazonses.com')) return 'Amazon SES';
-        if (received.includes('sendgrid.net')) return 'SendGrid';
+    // Check headers for ESP signatures
+    if (headers) {
+        const receivedHeaders = headers.get('received');
+        const xOriginatingIP = headers.get('x-originating-ip');
+        const xMailer = headers.get('x-mailer');
+        
+        const headerText = [receivedHeaders, xOriginatingIP, xMailer].join(' ').toLowerCase();
+        
+        for (const [esp, domains] of Object.entries(espPatterns)) {
+            if (domains.some(d => headerText.includes(d))) {
+                return esp;
+            }
+        }
     }
 
     return 'Unknown';
@@ -224,22 +279,44 @@ async function checkMailServerSecurity(domain) {
     try {
         const mxRecords = await dns.resolveMx(domain);
         if (!mxRecords || mxRecords.length === 0) {
-            return { hasValidMX: false, supportsTLS: false, hasValidCert: false, isOpenRelay: false };
+            return { 
+                hasValidMX: false, 
+                supportsTLS: false, 
+                hasValidCert: false, 
+                mxHost: null 
+            };
         }
 
         const primaryMX = mxRecords.sort((a, b) => a.priority - b.priority)[0];
         const mxHost = primaryMX.exchange;
 
         const tlsResult = await new Promise((resolve) => {
-            const socket = tls.connect({ port: 25, host: mxHost, rejectUnauthorized: false, timeout: 5000 });
+            const socket = tls.connect({ 
+                port: 25, 
+                host: mxHost, 
+                rejectUnauthorized: false, 
+                timeout: 10000 
+            });
             
             socket.on('secureConnect', () => {
                 const cert = socket.getPeerCertificate();
                 socket.end();
-                resolve({ supportsTLS: true, hasValidCert: socket.authorized, certInfo: cert });
+                resolve({ 
+                    supportsTLS: true, 
+                    hasValidCert: socket.authorized,
+                    certInfo: {
+                        subject: cert.subject,
+                        issuer: cert.issuer,
+                        validFrom: cert.valid_from,
+                        validTo: cert.valid_to
+                    }
+                });
             });
             
-            socket.on('error', () => resolve({ supportsTLS: false, hasValidCert: false }));
+            socket.on('error', () => {
+                resolve({ supportsTLS: false, hasValidCert: false });
+            });
+            
             socket.on('timeout', () => {
                 socket.destroy();
                 resolve({ supportsTLS: false, hasValidCert: false });
@@ -249,17 +326,22 @@ async function checkMailServerSecurity(domain) {
         return {
             hasValidMX: true,
             mxHost: mxHost,
-            supportsTLS: tlsResult.supportsTLS,
-            hasValidCert: tlsResult.hasValidCert,
-            isOpenRelay: false
+            ...tlsResult
         };
     } catch (error) {
-        return { hasValidMX: false, supportsTLS: false, hasValidCert: false, isOpenRelay: false };
+        console.error(`Error checking mail server security for ${domain}:`, error.message);
+        return { 
+            hasValidMX: false, 
+            supportsTLS: false, 
+            hasValidCert: false, 
+            mxHost: null 
+        };
     }
 }
 
 // --- API ENDPOINTS ---
 
+// OAuth2 Authentication
 app.get('/api/auth/google', (req, res) => {
     const { accountId } = req.query;
     const url = oauth2Client.generateAuthUrl({
@@ -302,19 +384,23 @@ app.get('/api/auth/google/callback', async (req, res) => {
             password: null,
             authStatus: 'valid',
             lastError: null,
+            lastConnected: new Date(),
             updatedAt: new Date()
         };
         
-        const updateOperation = { $set: accountData };
         const query = state ? { _id: new ObjectId(state) } : { user: userEmail };
 
         await db.collection('accounts').updateOne(
             query,
-            { ...updateOperation, $setOnInsert: { createdAt: new Date() } },
+            { 
+                $set: accountData, 
+                $setOnInsert: { createdAt: new Date() } 
+            },
             { upsert: true }
         );
 
-        res.redirect(`${frontendUrl}?auth_success=true&email=${encodeURIComponent(userEmail)}`);
+        console.log(`✓ Google OAuth completed for ${userEmail}`);
+        res.redirect(`${frontendUrl}?auth_success=true`);
 
     } catch (error) {
         console.error('Error during Google OAuth callback:', error);
@@ -322,19 +408,27 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
 });
 
+// Manual Account Addition
 app.post('/api/accounts', async (req, res) => {
     const { host, port, user, password } = req.body;
     
+    if (!host || !port || !user || !password) {
+        return res.status(400).json({ 
+            message: 'All fields (host, port, user, password) are required.' 
+        });
+    }
+    
     try {
+        // Test connection before saving
         const testConfig = {
             imap: { 
                 host, 
                 port: parseInt(port, 10), 
                 tls: true, 
-                authTimeout: 15000,
-                connTimeout: 15000, 
+                authTimeout: 20000,
+                connTimeout: 20000, 
                 user, 
-                password, 
+                password,
                 tlsOptions: { 
                     rejectUnauthorized: false,
                     servername: host
@@ -345,7 +439,7 @@ app.post('/api/accounts', async (req, res) => {
         console.log(`Testing IMAP connection for ${user}@${host}:${port}`);
         const testConnection = await imaps.connect(testConfig);
         await testConnection.end();
-        console.log(`✓ IMAP connection successful for ${user}`);
+        console.log(`✓ IMAP connection test successful for ${user}`);
 
         const newAccount = {
             host, 
@@ -355,104 +449,190 @@ app.post('/api/accounts', async (req, res) => {
             authType: 'PLAIN', 
             authStatus: 'valid', 
             lastError: null,
+            lastConnected: new Date(),
             createdAt: new Date(), 
             updatedAt: new Date()
         };
 
         const result = await db.collection('accounts').insertOne(newAccount);
+        
         res.status(201).json({ 
             message: 'Account added successfully!', 
             accountId: result.insertedId 
         });
+        
     } catch (error) {
         console.error('Error adding account:', error.message);
         
         if (error.code === 11000) {
-            return res.status(409).json({ message: "An account with this email already exists." });
+            return res.status(409).json({ 
+                message: "An account with this email already exists." 
+            });
         }
         
+        // Enhanced error messages for common authentication issues
         const errorMessage = error.message.toLowerCase();
         
         if (errorMessage.includes('invalid credentials') || 
             errorMessage.includes('authentication failed') ||
             errorMessage.includes('login failed') ||
-            errorMessage.includes('[authenticationfailed]')) {
+            errorMessage.includes('[authenticationfailed]') ||
+            errorMessage.includes('auth failed')) {
             return res.status(400).json({ 
-                message: "Authentication failed. Please check your credentials. If using Gmail, Yahoo, or Outlook, you may need to use an 'App Password' instead of your regular password. Generate one in your account's security settings and try again." 
+                message: "❌ Authentication failed. If using Gmail, Yahoo, or Outlook, you MUST use an 'App Password' instead of your regular password.\n\n📋 Steps to create an App Password:\n• Gmail: Google Account → Security → 2-Step Verification → App passwords\n• Yahoo: Account Security → Generate app password\n• Outlook: Microsoft Account → Security → App passwords\n\nThen use the generated app password here instead of your regular password." 
             });
         }
         
-        if (errorMessage.includes('connection') || errorMessage.includes('timeout')) {
+        if (errorMessage.includes('connection') || 
+            errorMessage.includes('timeout') ||
+            errorMessage.includes('enotfound') ||
+            errorMessage.includes('econnrefused')) {
             return res.status(400).json({ 
-                message: "Connection failed. Please check the server settings (host and port) and try again." 
+                message: "❌ Connection failed. Please verify:\n• Host name is correct (e.g., imap.gmail.com)\n• Port number is correct (usually 993 for SSL/TLS)\n• Internet connection is stable\n• Firewall isn't blocking the connection" 
             });
         }
         
-        res.status(400).json({ message: `Connection failed: ${error.message}` });
+        res.status(400).json({ 
+            message: `Connection failed: ${error.message}` 
+        });
     }
 });
 
+// Get Accounts
 app.get('/api/accounts', async (req, res) => {
     try {
-        const accounts = await db.collection('accounts').find({}, { projection: { password: 0, refreshToken: 0, accessToken: 0 } }).toArray();
+        const accounts = await db.collection('accounts').find(
+            {}, 
+            { 
+                projection: { 
+                    password: 0, 
+                    refreshToken: 0, 
+                    accessToken: 0 
+                } 
+            }
+        ).toArray();
+        
         res.json(accounts);
     } catch (error) {
+        console.error('Error fetching accounts:', error);
         res.status(500).json({ message: 'Failed to fetch accounts' });
     }
 });
 
-app.delete('/api/accounts/:id', async (req, res) => {
+// Delete Account
+app.delete('/api/accounts/:accountId', async (req, res) => {
     try {
-        const { id } = req.params;
-        await db.collection('accounts').deleteOne({ _id: new ObjectId(id) });
+        const { accountId } = req.params;
         
-        // Clean up any connection pool for this account
-        if (connectionPools.has(id)) {
-            const pool = connectionPools.get(id);
+        // Clean up connection pool
+        const poolKey = accountId;
+        if (connectionPools.has(poolKey)) {
+            const pool = connectionPools.get(poolKey);
             await pool.drain();
             await pool.clear();
-            connectionPools.delete(id);
+            connectionPools.delete(poolKey);
         }
+        
+        // Delete from database
+        const result = await db.collection('accounts').deleteOne({ 
+            _id: new ObjectId(accountId) 
+        });
+        
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: 'Account not found' });
+        }
+        
+        // Also delete associated emails
+        await db.collection('emails').deleteMany({ 
+            accountId: new ObjectId(accountId) 
+        });
         
         res.json({ message: 'Account deleted successfully' });
     } catch (error) {
+        console.error('Error deleting account:', error);
         res.status(500).json({ message: 'Failed to delete account' });
     }
 });
 
+// Process Account Emails
 app.post('/api/process/:accountId', async (req, res) => {
     const { accountId } = req.params;
+    
     try {
+        const account = await db.collection('accounts').findOne({ 
+            _id: new ObjectId(accountId) 
+        });
+        
+        if (!account) {
+            return res.status(404).json({ message: 'Account not found' });
+        }
+        
         const jobId = uuidv4();
         syncJobs[jobId] = { 
             id: jobId, 
             type: 'process', 
             accountId, 
             status: 'running', 
-            progress: { total: 0, processed: 0, currentFolder: '' }, 
+            progress: { 
+                total: 0, 
+                processed: 0, 
+                currentFolder: '',
+                errors: 0
+            }, 
             error: null, 
             createdAt: new Date() 
         };
         
+        // Start processing in background
         processAccountEmails(jobId, accountId).catch(err => {
             console.error(`Processing job ${jobId} failed:`, err);
             syncJobs[jobId].status = 'failed';
             syncJobs[jobId].error = err.message;
         });
         
-        res.status(202).json({ message: 'Email processing started', jobId });
+        res.status(202).json({ 
+            message: 'Email processing started', 
+            jobId,
+            account: account.user
+        });
+        
     } catch (error) {
-        console.error('Error starting processing:', error);
+        console.error('Error starting email processing:', error);
         res.status(500).json({ message: 'Failed to start processing' });
     }
 });
 
+// Sync Jobs
 app.post('/api/sync/start', async (req, res) => {
     const { sourceAccountId, destAccountId } = req.body;
-    if (sourceAccountId === destAccountId) {
-        return res.status(400).json({ message: 'Source and destination must be different' });
+    
+    if (!sourceAccountId || !destAccountId) {
+        return res.status(400).json({ 
+            message: 'Both source and destination account IDs are required' 
+        });
     }
+    
+    if (sourceAccountId === destAccountId) {
+        return res.status(400).json({ 
+            message: 'Source and destination accounts must be different' 
+        });
+    }
+    
     try {
+        // Verify both accounts exist
+        const [sourceAccount, destAccount] = await Promise.all([
+            db.collection('accounts').findOne({ _id: new ObjectId(sourceAccountId) }),
+            db.collection('accounts').findOne({ _id: new ObjectId(destAccountId) })
+        ]);
+        
+        if (!sourceAccount) {
+            return res.status(404).json({ message: 'Source account not found' });
+        }
+        
+        if (!destAccount) {
+            return res.status(404).json({ message: 'Destination account not found' });
+        }
+        
         const jobId = uuidv4();
         syncJobs[jobId] = { 
             id: jobId, 
@@ -460,66 +640,143 @@ app.post('/api/sync/start', async (req, res) => {
             sourceAccountId, 
             destAccountId, 
             status: 'running', 
-            progress: { total: 0, processed: 0, currentFolder: '' }, 
+            progress: { 
+                total: 0, 
+                processed: 0, 
+                currentFolder: '',
+                errors: 0
+            }, 
             error: null, 
             createdAt: new Date() 
         };
         
+        // Start sync in background
         processEmailSync(jobId).catch(err => {
             console.error(`Sync job ${jobId} failed:`, err);
             syncJobs[jobId].status = 'failed';
             syncJobs[jobId].error = err.message;
         });
         
-        res.status(202).json({ message: 'Sync job started', jobId });
+        res.status(202).json({ 
+            message: 'Sync job started', 
+            jobId,
+            source: sourceAccount.user,
+            destination: destAccount.user
+        });
+        
     } catch (error) {
-        console.error('Error starting sync:', error);
+        console.error('Error starting sync job:', error);
         res.status(500).json({ message: 'Failed to start sync' });
     }
 });
 
 app.post('/api/sync/pause/:jobId', (req, res) => {
     const { jobId } = req.params;
-    if (syncJobs[jobId] && syncJobs[jobId].status === 'running') {
-        syncJobs[jobId].status = 'paused';
-        res.json({ message: 'Job paused' });
-    } else {
-        res.status(404).json({ message: 'Job not found or not running' });
+    const job = syncJobs[jobId];
+    
+    if (!job) {
+        return res.status(404).json({ message: 'Job not found' });
     }
+    
+    if (job.status !== 'running') {
+        return res.status(400).json({ 
+            message: `Job is not running (current status: ${job.status})` 
+        });
+    }
+    
+    job.status = 'paused';
+    res.json({ message: 'Job paused successfully' });
 });
 
 app.post('/api/sync/resume/:jobId', (req, res) => {
     const { jobId } = req.params;
     const job = syncJobs[jobId];
-    if (job && job.status === 'paused') {
-        job.status = 'running';
-        const task = job.type === 'process' ? 
-            processAccountEmails(jobId, job.accountId) : 
-            processEmailSync(jobId);
-        
-        task.catch(err => {
-            console.error(`Job ${jobId} failed on resume:`, err);
-            job.status = 'failed';
-            job.error = err.message;
-        });
-        
-        res.json({ message: 'Job resumed' });
-    } else {
-        res.status(404).json({ message: 'Job not found or not paused' });
+    
+    if (!job) {
+        return res.status(404).json({ message: 'Job not found' });
     }
+    
+    if (job.status !== 'paused') {
+        return res.status(400).json({ 
+            message: `Job is not paused (current status: ${job.status})` 
+        });
+    }
+    
+    job.status = 'running';
+    
+    const task = job.type === 'process' 
+        ? processAccountEmails(jobId, job.accountId) 
+        : processEmailSync(jobId);
+        
+    task.catch(err => {
+        console.error(`Resumed job ${jobId} failed:`, err);
+        job.status = 'failed';
+        job.error = err.message;
+    });
+    
+    res.json({ message: 'Job resumed successfully' });
 });
 
+// Job Status Endpoints
 app.get('/api/status', (req, res) => {
-    res.json(Object.values(syncJobs));
+    const jobs = Object.values(syncJobs).map(job => ({
+        ...job,
+        duration: job.createdAt ? Date.now() - job.createdAt.getTime() : 0
+    }));
+    
+    res.json(jobs);
 });
 
 app.get('/api/sync/status', (req, res) => {
-    res.json(Object.values(syncJobs));
+    // Keep for backward compatibility
+    const jobs = Object.values(syncJobs).map(job => ({
+        ...job,
+        duration: job.createdAt ? Date.now() - job.createdAt.getTime() : 0
+    }));
+    
+    res.json(jobs);
 });
 
+// Get specific job status
+app.get('/api/status/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    const job = syncJobs[jobId];
+    
+    if (!job) {
+        return res.status(404).json({ message: 'Job not found' });
+    }
+    
+    res.json({
+        ...job,
+        duration: job.createdAt ? Date.now() - job.createdAt.getTime() : 0
+    });
+});
+
+// Cancel job
+app.delete('/api/jobs/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    const job = syncJobs[jobId];
+    
+    if (!job) {
+        return res.status(404).json({ message: 'Job not found' });
+    }
+    
+    job.status = 'cancelled';
+    res.json({ message: 'Job cancelled successfully' });
+});
+
+// Email Data
 app.get('/api/emails', async (req, res) => {
     try {
-        const { search, limit = 50, skip = 0, accountId } = req.query;
+        const { 
+            search, 
+            limit = 50, 
+            skip = 0, 
+            accountId,
+            sortBy = 'receivedAt',
+            sortOrder = 'desc'
+        } = req.query;
+        
         let query = {};
         
         if (accountId) {
@@ -528,62 +785,124 @@ app.get('/api/emails', async (req, res) => {
         
         if (search) {
             query.$or = [
-                { from: { $regex: search, $options: 'i' } },
                 { subject: { $regex: search, $options: 'i' } },
+                { from: { $regex: search, $options: 'i' } },
                 { body: { $regex: search, $options: 'i' } }
             ];
         }
         
-        const emails = await db.collection('emails')
-            .find(query)
-            .sort({ receivedAt: -1 })
-            .limit(parseInt(limit))
-            .skip(parseInt(skip))
-            .toArray();
-            
-        const total = await db.collection('emails').countDocuments(query);
-        res.json({ emails, total });
+        const sortOptions = {};
+        sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
+        
+        const [emails, total] = await Promise.all([
+            db.collection('emails')
+                .find(query)
+                .sort(sortOptions)
+                .limit(parseInt(limit))
+                .skip(parseInt(skip))
+                .toArray(),
+            db.collection('emails').countDocuments(query)
+        ]);
+        
+        res.json({ 
+            emails, 
+            total,
+            page: Math.floor(parseInt(skip) / parseInt(limit)) + 1,
+            totalPages: Math.ceil(total / parseInt(limit))
+        });
+        
     } catch (error) {
         console.error('Error fetching emails:', error);
         res.status(500).json({ message: 'Failed to fetch emails' });
     }
 });
 
+// Statistics
 app.get('/api/stats', async (req, res) => {
     try {
-        const [totalEmails, espStats, domainStats] = await Promise.all([
-            db.collection('emails').countDocuments(),
+        const { accountId } = req.query;
+        let matchStage = {};
+        
+        if (accountId) {
+            matchStage.accountId = new ObjectId(accountId);
+        }
+        
+        const [
+            totalEmails,
+            espStats,
+            domainStats,
+            dailyStats,
+            accountStats
+        ] = await Promise.all([
+            db.collection('emails').countDocuments(matchStage),
+            
             db.collection('emails').aggregate([
-                { $group: { _id: '$analytics.esp', count: { $sum: 1 } } }, 
-                { $sort: { count: -1 } }
-            ]).toArray(),
-            db.collection('emails').aggregate([
-                { $group: { _id: '$analytics.sendingDomain', count: { $sum: 1 } } }, 
+                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+                { $group: { _id: '$analytics.esp', count: { $sum: 1 } } },
                 { $sort: { count: -1 } },
                 { $limit: 10 }
+            ]).toArray(),
+            
+            db.collection('emails').aggregate([
+                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+                { $group: { _id: '$analytics.sendingDomain', count: { $sum: 1 } } },
+                { $sort: { count: -1 } },
+                { $limit: 10 }
+            ]).toArray(),
+            
+            db.collection('emails').aggregate([
+                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+                {
+                    $group: {
+                        _id: {
+                            $dateToString: { 
+                                format: '%Y-%m-%d', 
+                                date: '$receivedAt' 
+                            }
+                        },
+                        count: { $sum: 1 }
+                    }
+                },
+                { $sort: { _id: -1 } },
+                { $limit: 30 }
+            ]).toArray(),
+            
+            db.collection('emails').aggregate([
+                { $group: { _id: '$accountId', count: { $sum: 1 } } },
+                { $sort: { count: -1 } }
             ]).toArray()
         ]);
         
-        res.json({ totalEmails, espDistribution: espStats, topDomains: domainStats });
+        res.json({ 
+            totalEmails,
+            espDistribution: espStats,
+            topDomains: domainStats,
+            dailyEmailCount: dailyStats,
+            emailsByAccount: accountStats
+        });
+        
     } catch (error) {
-        console.error('Error fetching stats:', error);
+        console.error('Error fetching statistics:', error);
         res.status(500).json({ message: 'Failed to fetch statistics' });
     }
 });
 
 // --- CORE PROCESSING LOGIC ---
+
 async function processAccountEmails(jobId, accountId) {
     const job = syncJobs[jobId];
     if (!job) return;
     
-    console.log(`Starting email processing for account ${accountId}`);
+    console.log(`Starting email processing for account ${accountId} (Job: ${jobId})`);
     
     try {
         await withConnection(accountId, async (connection) => {
             const boxes = await getSelectableMailboxes(connection);
-            console.log(`Found ${Object.keys(boxes).length} mailboxes to process`);
+            const boxNames = Object.keys(boxes);
             
-            for (const boxName of Object.keys(boxes)) {
+            console.log(`Found ${boxNames.length} mailboxes to process for account ${accountId}`);
+            
+            for (const boxName of boxNames) {
                 if (job.status !== 'running') {
                     console.log(`Job ${jobId} is no longer running, stopping processing`);
                     return;
@@ -592,75 +911,132 @@ async function processAccountEmails(jobId, accountId) {
                 console.log(`Processing mailbox: ${boxName}`);
                 job.progress.currentFolder = boxName;
                 
-                await connection.openBox(boxName, true);
-                const messages = await connection.search(['ALL'], { bodies: [''], struct: true });
-                
-                console.log(`Found ${messages.length} messages in ${boxName}`);
-                job.progress.total += messages.length;
-                
-                for (const message of messages) {
-                    if (job.status !== 'running') return;
-                    await processMessage(message, accountId);
-                    job.progress.processed++;
+                try {
+                    await connection.openBox(boxName, true);
+                    const messages = await connection.search(['ALL'], { 
+                        bodies: ['HEADER', 'TEXT'], 
+                        struct: true 
+                    });
+                    
+                    console.log(`Found ${messages.length} messages in ${boxName}`);
+                    job.progress.total += messages.length;
+                    
+                    for (const message of messages) {
+                        if (job.status !== 'running') {
+                            console.log(`Job ${jobId} paused during processing`);
+                            return;
+                        }
+                        
+                        try {
+                            await processMessage(message, accountId);
+                            job.progress.processed++;
+                        } catch (messageError) {
+                            console.error(`Error processing message in ${boxName}:`, messageError.message);
+                            job.progress.errors = (job.progress.errors || 0) + 1;
+                        }
+                        
+                        // Add small delay to prevent overwhelming the server
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                    }
+                } catch (boxError) {
+                    console.error(`Error processing mailbox ${boxName}:`, boxError.message);
+                    job.progress.errors = (job.progress.errors || 0) + 1;
                 }
             }
         });
         
         if (job.status === 'running') {
             job.status = 'completed';
+            job.completedAt = new Date();
             console.log(`✓ Email processing completed for account ${accountId}`);
         }
+        
     } catch (error) {
         console.error(`✗ Email processing failed for account ${accountId}:`, error.message);
         job.status = 'failed';
         job.error = error.message;
+        job.failedAt = new Date();
     }
 }
 
 async function processMessage(message, accountId) {
     try {
-        const allPart = message.parts.find(part => part.which === '');
-        if (!allPart) return;
+        const headerPart = message.parts.find(part => part.which === 'HEADER');
+        const textPart = message.parts.find(part => part.which === 'TEXT');
         
-        const parsedMail = await simpleParser(allPart.body);
-        if (!parsedMail.messageId) return;
+        if (!headerPart && !textPart) {
+            console.warn('Message has no processable parts');
+            return;
+        }
         
-        const fromAddress = parsedMail.from?.value?.[0]?.address || 'unknown';
-        const sendingDomain = fromAddress.split('@')[1] || 'unknown';
+        // Combine header and body for parsing
+        const emaildata = headerPart ? headerPart.body : '';
+        const bodyData = textPart ? textPart.body : '';
+        const fullMessage = emaildata + '\r\n\r\n' + bodyData;
         
+        const parsedMail = await simpleParser(fullMessage);
+        
+        if (!parsedMail.messageId) {
+            console.warn('Message has no messageId, skipping');
+            return;
+        }
+        
+        const fromAddress = parsedMail.from?.value?.[0]?.address || parsedMail.from?.text || 'unknown';
+        const sendingDomain = fromAddress.includes('@') ? fromAddress.split('@')[1] : 'unknown';
+        
+        // Enhanced analytics
         const [esp, mailServerSecurity] = await Promise.all([
             detectESP(fromAddress, parsedMail.headers),
             checkMailServerSecurity(sendingDomain)
         ]);
 
-        const sentDate = parsedMail.date || new Date();
-        const receivedDate = message.attributes.date || new Date();
+        const sentDate = parsedMail.date || message.attributes?.date || new Date();
+        const receivedDate = message.attributes?.date || parsedMail.date || new Date();
 
         const emailData = {
             accountId: new ObjectId(accountId),
             messageId: parsedMail.messageId,
             from: fromAddress,
-            to: parsedMail.to?.text,
-            subject: parsedMail.subject,
-            body: parsedMail.text,
+            to: parsedMail.to?.text || parsedMail.to?.value?.map(addr => addr.address).join(', ') || '',
+            cc: parsedMail.cc?.text || '',
+            bcc: parsedMail.bcc?.text || '',
+            subject: parsedMail.subject || '(No Subject)',
+            body: parsedMail.text || parsedMail.html || '',
+            htmlBody: parsedMail.html || '',
             receivedAt: receivedDate,
             sentAt: sentDate,
-            flags: message.flags || [],
+            flags: message.attributes?.flags || [],
+            size: message.attributes?.size || 0,
+            uid: message.attributes?.uid || 0,
             analytics: {
                 sendingDomain,
                 esp,
                 sentReceivedDelta: Math.round((receivedDate.getTime() - sentDate.getTime()) / 1000),
-                mailServerSecurity
-            }
+                mailServerSecurity,
+                hasAttachments: (parsedMail.attachments && parsedMail.attachments.length > 0) || false,
+                attachmentCount: parsedMail.attachments ? parsedMail.attachments.length : 0,
+                wordCount: parsedMail.text ? parsedMail.text.split(/\s+/).length : 0,
+                isHTML: !!parsedMail.html,
+                priority: parsedMail.headers.get('x-priority') || parsedMail.headers.get('priority') || 'normal'
+            },
+            processedAt: new Date()
         };
         
         await db.collection('emails').updateOne(
-            { messageId: emailData.messageId, accountId: emailData.accountId }, 
-            { $set: emailData }, 
+            { 
+                messageId: emailData.messageId, 
+                accountId: emailData.accountId 
+            }, 
+            { 
+                $set: emailData,
+                $setOnInsert: { createdAt: new Date() }
+            }, 
             { upsert: true }
         );
+        
     } catch (error) {
-        console.error('Error processing individual message:', error);
+        console.error('Error processing individual message:', error.message);
+        throw error;
     }
 }
 
@@ -668,36 +1044,81 @@ async function processEmailSync(jobId) {
     const job = syncJobs[jobId];
     if (!job) return;
     
+    console.log(`Starting email sync (Job: ${jobId})`);
+    
     try {
         await withConnection(job.sourceAccountId, async (sourceConn) => {
             await withConnection(job.destAccountId, async (destConn) => {
                 const boxes = await getSelectableMailboxes(sourceConn);
-                for (const boxName of Object.keys(boxes)) {
-                    if (job.status !== 'running') return;
-                    job.progress.currentFolder = boxName;
-                    await sourceConn.openBox(boxName, true);
-                    try { 
-                        await destConn.addBox(boxName); 
-                    } catch (e) { 
-                        // Box likely exists, ignore error
+                const boxNames = Object.keys(boxes);
+                
+                console.log(`Found ${boxNames.length} mailboxes to sync`);
+                
+                for (const boxName of boxNames) {
+                    if (job.status !== 'running') {
+                        console.log(`Sync job ${jobId} is no longer running, stopping`);
+                        return;
                     }
                     
-                    const messages = await sourceConn.search(['ALL'], { bodies: [''], struct: true });
-                    job.progress.total += messages.length;
+                    console.log(`Syncing mailbox: ${boxName}`);
+                    job.progress.currentFolder = boxName;
                     
-                    for (const message of messages) {
-                        if (job.status !== 'running') return;
-                        const allPart = message.parts.find(part => part.which === '');
-                        await destConn.append(
-                            allPart.body, 
-                            { 
-                                mailbox: boxName, 
-                                flags: message.flags.filter(f => f !== '\\Recent'), 
-                                date: message.attributes.date 
+                    try {
+                        await sourceConn.openBox(boxName, true);
+                        
+                        // Try to create mailbox on destination (ignore if exists)
+                        try {
+                            await destConn.addBox(boxName);
+                        } catch (e) {
+                            // Mailbox likely already exists, continue
+                        }
+                        
+                        const messages = await sourceConn.search(['ALL'], { 
+                            bodies: [''], 
+                            struct: true 
+                        });
+                        
+                        console.log(`Found ${messages.length} messages to sync in ${boxName}`);
+                        job.progress.total += messages.length;
+                        
+                        for (const message of messages) {
+                            if (job.status !== 'running') {
+                                console.log(`Sync job ${jobId} paused during processing`);
+                                return;
                             }
-                        );
-                        await processMessage(message, job.sourceAccountId);
-                        job.progress.processed++;
+                            
+                            try {
+                                const allPart = message.parts.find(part => part.which === '');
+                                if (!allPart) continue;
+                                
+                                const mailBuffer = Buffer.from(allPart.body);
+                                const flags = message.attributes?.flags?.filter(f => f !== '\\Recent') || [];
+                                const dateHeader = message.attributes?.date || new Date();
+
+                                // Append to destination mailbox
+                                await destConn.append(mailBuffer, { 
+                                    mailbox: boxName, 
+                                    flags, 
+                                    date: dateHeader 
+                                });
+
+                                // Also process for analytics
+                                await processMessage(message, job.sourceAccountId);
+                                
+                                job.progress.processed++;
+                                
+                            } catch (messageError) {
+                                console.error(`Error syncing message in ${boxName}:`, messageError.message);
+                                job.progress.errors = (job.progress.errors || 0) + 1;
+                            }
+                            
+                            // Small delay to prevent overwhelming servers
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                        
+                    } catch (boxError) {
+                        console.error(`Error syncing mailbox ${boxName}:`, boxError.message);
+                        job.progress.errors = (job.progress.errors || 0) + 1;
                     }
                 }
             });
@@ -705,82 +1126,193 @@ async function processEmailSync(jobId) {
         
         if (job.status === 'running') {
             job.status = 'completed';
+            job.completedAt = new Date();
+            console.log(`✓ Email sync completed (Job: ${jobId})`);
         }
+        
     } catch (error) {
-        console.error(`Sync job ${jobId} failed:`, error);
+        console.error(`✗ Email sync failed (Job: ${jobId}):`, error.message);
         job.status = 'failed';
         job.error = error.message;
+        job.failedAt = new Date();
     }
 }
 
 async function getSelectableMailboxes(connection) {
-    const mailboxes = await connection.getBoxes();
-    const selectable = {};
-    
-    function findSelectable(boxes, prefix = '') {
-        for (const name in boxes) {
-            const path = prefix ? `${prefix}${boxes[name].delimiter}${name}` : name;
-            if (!boxes[name].attribs.includes('\\Noselect')) {
-                selectable[path] = boxes[name];
-            }
-            if (boxes[name].children) {
-                findSelectable(boxes[name].children, path);
+    try {
+        const mailboxes = await connection.getBoxes();
+        const selectable = {};
+        
+        function findSelectable(boxes, prefix = '') {
+            for (const name in boxes) {
+                const box = boxes[name];
+                const path = prefix ? `${prefix}${box.delimiter}${name}` : name;
+                
+                // Only include selectable mailboxes (not \Noselect)
+                if (!box.attribs || !box.attribs.includes('\\Noselect')) {
+                    selectable[path] = box;
+                }
+                
+                // Recursively check children
+                if (box.children && Object.keys(box.children).length > 0) {
+                    findSelectable(box.children, path);
+                }
             }
         }
+        
+        findSelectable(mailboxes);
+        return selectable;
+        
+    } catch (error) {
+        console.error('Error getting selectable mailboxes:', error.message);
+        throw error;
     }
-    
-    findSelectable(mailboxes);
-    return selectable;
 }
 
 // --- CLEANUP AND START SERVER ---
-async function shutdown(signal) {
-    console.log(`Received ${signal}. Shutting down gracefully...`);
+
+async function cleanupOldJobs() {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
     
+    for (const [jobId, job] of Object.entries(syncJobs)) {
+        if (job.createdAt < cutoff && 
+            ['completed', 'failed', 'cancelled'].includes(job.status)) {
+            delete syncJobs[jobId];
+        }
+    }
+}
+
+// Clean up old jobs every hour
+setInterval(cleanupOldJobs, 60 * 60 * 1000);
+
+async function shutdown(signal) {
+    console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+    
+    // Mark all running jobs as cancelled
+    for (const job of Object.values(syncJobs)) {
+        if (job.status === 'running') {
+            job.status = 'cancelled';
+            job.error = 'Server shutdown';
+        }
+    }
+    
+    // Close all connection pools
     for (const [accountId, pool] of connectionPools.entries()) {
         try {
+            console.log(`Closing connection pool for account ${accountId}...`);
             await pool.drain();
             await pool.clear();
-            console.log(`Pool for account ${accountId} cleared.`);
         } catch (error) {
-            console.error(`Error closing pool for account ${accountId}:`, error);
+            console.error(`Error closing pool for account ${accountId}:`, error.message);
+        }
+    }
+    connectionPools.clear();
+
+    // Close MongoDB connection
+    if (mongoClient) {
+        try {
+            await mongoClient.close();
+            console.log("MongoDB connection closed.");
+        } catch (error) {
+            console.error("Error closing MongoDB connection:", error.message);
         }
     }
 
-    if (mongoClient) {
-        await mongoClient.close();
-        console.log("MongoDB connection closed.");
-    }
-
+    console.log("Graceful shutdown completed.");
     process.exit(0);
 }
 
+// Handle shutdown signals
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGUSR2', () => shutdown('SIGUSR2')); // For nodemon restarts
 
-// Initialize the server
-MongoClient.connect(mongoUri)
-    .then(async (client) => {
-        mongoClient = client;
-        db = client.db();
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// --- START APPLICATION ---
+
+async function startApplication() {
+    try {
+        console.log('🔄 Connecting to MongoDB...');
+        mongoClient = await MongoClient.connect(mongoUri);
+        db = mongoClient.db();
         
-        // Create indexes
+        console.log('🔧 Creating database indexes...');
         await Promise.all([
-            db.collection('emails').createIndex({ messageId: 1, accountId: 1 }, { unique: true }),
-            db.collection('emails').createIndex({ from: 1 }),
-            db.collection('emails').createIndex({ subject: 'text', body: 'text' }),
-            db.collection('emails').createIndex({ receivedAt: -1 }),
-            db.collection('emails').createIndex({ accountId: 1 }),
-            db.collection('accounts').createIndex({ user: 1 }, { unique: true })
+            // Email indexes
+            db.collection('emails').createIndex(
+                { messageId: 1, accountId: 1 }, 
+                { unique: true, background: true }
+            ),
+            db.collection('emails').createIndex(
+                { accountId: 1 }, 
+                { background: true }
+            ),
+            db.collection('emails').createIndex(
+                { from: 1 }, 
+                { background: true }
+            ),
+            db.collection('emails').createIndex(
+                { receivedAt: -1 }, 
+                { background: true }
+            ),
+            db.collection('emails').createIndex(
+                { subject: 'text', body: 'text' }, 
+                { background: true }
+            ),
+            db.collection('emails').createIndex(
+                { 'analytics.esp': 1 }, 
+                { background: true }
+            ),
+            db.collection('emails').createIndex(
+                { 'analytics.sendingDomain': 1 }, 
+                { background: true }
+            ),
+            
+            // Account indexes
+            db.collection('accounts').createIndex(
+                { user: 1 }, 
+                { unique: true, background: true }
+            ),
+            db.collection('accounts').createIndex(
+                { authStatus: 1 }, 
+                { background: true }
+            ),
+            db.collection('accounts').createIndex(
+                { createdAt: -1 }, 
+                { background: true }
+            )
         ]);
         
-        console.log("✓ Connected to MongoDB and created indexes");
+        console.log("✅ Connected to MongoDB and created indexes");
         
+        // Start the server
         app.listen(port, () => {
             console.log(`🚀 Email Sync & Analytics Hub running on http://localhost:${port}`);
+            console.log(`📧 Ready to process emails and sync accounts!`);
+            console.log(`🔍 Available endpoints:`);
+            console.log(`   • POST /api/accounts - Add manual IMAP account`);
+            console.log(`   • GET  /api/auth/google - Google OAuth authentication`);
+            console.log(`   • POST /api/process/:accountId - Process account emails`);
+            console.log(`   • POST /api/sync/start - Start email sync between accounts`);
+            console.log(`   • GET  /api/status - View job status`);
+            console.log(`   • GET  /api/emails - View processed emails`);
+            console.log(`   • GET  /api/stats - View email statistics`);
         });
-    })
-    .catch(err => {
-        console.error("✗ Could not connect to MongoDB.", err);
+        
+    } catch (error) {
+        console.error("❌ Failed to start application:", error);
         process.exit(1);
-    });
+    }
+}
+
+// Start the application
+startApplication();
