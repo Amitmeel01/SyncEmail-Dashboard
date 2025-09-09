@@ -115,7 +115,7 @@ export default function App() {
     } catch (error) { 
         console.error("Error fetching job statuses:", error);
     }
-}, [emails,accounts]);
+}, [emails]);
 
     const fetchEmails = useCallback(async () => {
         try {
@@ -148,15 +148,15 @@ export default function App() {
         fetchEmails();
         fetchStats();
         
-        const intervalId = setInterval(() => {
-            fetchJobStatus();
-            fetchAccounts();
-            if (activeTab === 'dashboard') {
-                fetchStats();
-            }
-        }, 3000);
+        // const intervalId = setInterval(() => {
+        //     fetchJobStatus();
+        //     fetchAccounts();
+        //     if (activeTab === 'dashboard') {
+        //         fetchStats();
+        //     }
+        // }, 3000);
         
-        return () => clearInterval(intervalId);
+        // return () => clearInterval(intervalId);
     }, [fetchAccounts, fetchJobStatus, fetchEmails, fetchStats, activeTab]);
 
     useEffect(() => {
