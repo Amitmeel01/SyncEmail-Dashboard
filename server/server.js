@@ -250,61 +250,64 @@ app.get('/api/auth/google', (req, res) => {
 
 app.get('/api/auth/google/callback', async (req, res) => {
     const { code } = req.query;
+    const frontendUrl = "https://sync-email-dashboard.vercel.app/"; // Your frontend URL
+
+    // Handle the case where the user denies access
+    if (req.query.error) {
+        console.error('Google Auth Error:', req.query.error);
+        return res.redirect(`${frontendUrl}?error=auth_denied`);
+    }
+
+    if (!code) {
+        return res.redirect(`${frontendUrl}?error=missing_code`);
+    }
+
     try {
+        // Exchange the authorization code for tokens
         const { tokens } = await oauth2Client.getToken(code);
         oauth2Client.setCredentials(tokens);
 
+        // Get the user's email address
         const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
         const profile = await gmail.users.getProfile({ userId: 'me' });
         const userEmail = profile.data.emailAddress;
 
         if (!userEmail) {
-            return res.status(400).send('Could not retrieve email address from Google.');
+            return res.redirect(`${frontendUrl}?error=email_not_found`);
         }
 
+        // Prepare account data for the database
         const accountData = {
             host: 'imap.gmail.com',
             port: 993,
             user: userEmail,
             authType: 'XOAUTH2',
-            refreshToken: tokens.refresh_token,
+            refreshToken: tokens.refresh_token, // IMPORTANT: refresh_token is only sent the first time
             accessToken: tokens.access_token,
             tokenExpiry: new Date(tokens.expiry_date),
             password: null,
-            createdAt: new Date(),
             updatedAt: new Date()
         };
 
+        // Save or update the account in your database
         await db.collection('accounts').updateOne(
             { user: userEmail },
-            { $set: accountData, $setOnInsert: { createdAt: new Date() } },
+            { 
+                $set: accountData, 
+                $setOnInsert: { createdAt: new Date() } 
+            },
             { upsert: true }
         );
 
-        res.send(`
-            <html>
-                <body>
-                    <h2>Authentication Successful!</h2>
-                    <p>You can now close this window and return to the application.</p>
-                    <script>
-                        setTimeout(() => window.close(), 2000);
-                    </script>
-                </body>
-            </html>
-        `);
+        // Redirect to frontend on success
+        res.redirect(`${frontendUrl}?success=true`);
 
-        res.redirect("https://sync-email-dashboard.vercel.app/");
     } catch (error) {
-        console.error('Error during Google OAuth callback:', error);
-        res.status(500).send(`
-            <html>
-                <body>
-                    <h2>Authentication Failed</h2>
-                    <p>Error: ${error.message}</p>
-                    <p>Please close this window and try again.</p>
-                </body>
-            </html>
-        `);
+        console.error('Error during Google OAuth callback:', error.response ? error.response.data : error.message);
+        
+        // Redirect to frontend with a specific error message
+        const errorMessage = error.response?.data?.error || 'authentication_failed';
+        res.redirect(`${frontendUrl}?error=${errorMessage}`);
     }
 });
 
