@@ -110,11 +110,12 @@ export default function App() {
         const response = await fetch(`${API_URL}/api/status`);
         if (!response.ok) throw new Error('Failed to fetch jobs');
         const data = await response.json();
+        console.log("dd",data);
         setJobs(data);
     } catch (error) { 
         console.error("Error fetching job statuses:", error);
     }
-}, []);
+}, [emails,accounts]);
 
     const fetchEmails = useCallback(async () => {
         try {
