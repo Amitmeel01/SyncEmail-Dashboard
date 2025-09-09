@@ -90,7 +90,7 @@ export default function App() {
     const [activeTab, setActiveTab] = useState('dashboard');
     const [isLoading, setIsLoading] = useState(false);
     
-    const API_URL = 'http://localhost:3001';
+    const API_URL = 'https://syncemail-dashboard.onrender.com';
 
     // --- API Functions ---
     const fetchAccounts = useCallback(async () => {
