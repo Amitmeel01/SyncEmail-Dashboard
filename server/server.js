@@ -292,6 +292,8 @@ app.get('/api/auth/google/callback', async (req, res) => {
                 </body>
             </html>
         `);
+
+        res.redirect("https://sync-email-dashboard.vercel.app/");
     } catch (error) {
         console.error('Error during Google OAuth callback:', error);
         res.status(500).send(`
