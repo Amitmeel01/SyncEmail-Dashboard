@@ -131,7 +131,7 @@ export default function App() {
         }
     }, []);
 
-    const fetchStats = useCallback(async () => {
+    useEffect(async () => {
         try {
             const response = await fetch(`${API_URL}/api/stats`);
             if (!response.ok) throw new Error('Failed to fetch stats');
@@ -140,13 +140,14 @@ export default function App() {
         } catch (error) { 
             console.error("Error fetching stats:", error);
         }
-    }, []);
+    }, [fetchAccounts,fetchEmails]);
     
-    // --- Effects ---
+  
+    
     useEffect(() => {
         fetchAccounts();
         fetchEmails();
-        fetchStats();
+        // fetchStats();
         
         // const intervalId = setInterval(() => {
         //     fetchJobStatus();
@@ -157,7 +158,7 @@ export default function App() {
         // }, 3000);
         
         // return () => clearInterval(intervalId);
-    }, [fetchAccounts, fetchJobStatus, fetchEmails, fetchStats, activeTab]);
+    }, [fetchAccounts, fetchJobStatus, fetchEmails,  activeTab]);
 
     useEffect(() => {
     // Handle OAuth callback messages
