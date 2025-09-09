@@ -326,14 +326,36 @@ app.post('/api/accounts', async (req, res) => {
     
     try {
         const testConfig = {
-            imap: { host, port: parseInt(port, 10), tls: true, authTimeout: 10000, user, password, tlsOptions: { rejectUnauthorized: false } }
+            imap: { 
+                host, 
+                port: parseInt(port, 10), 
+                tls: true, 
+                authTimeout: 15000,
+                connTimeout: 15000, 
+                user, 
+                password, 
+                tlsOptions: { 
+                    rejectUnauthorized: false,
+                    servername: host
+                } 
+            }
         };
         
+        console.log(`Testing IMAP connection for ${user}@${host}:${port}`);
         const testConnection = await imaps.connect(testConfig);
         await testConnection.end();
+        console.log(`✓ IMAP connection successful for ${user}`);
 
         const newAccount = {
-            host, port: parseInt(port, 10), user, password: encrypt(password), authType: 'PLAIN', authStatus: 'valid', createdAt: new Date(), updatedAt: new Date()
+            host, 
+            port: parseInt(port, 10), 
+            user, 
+            password: encrypt(password), 
+            authType: 'PLAIN', 
+            authStatus: 'valid', 
+            lastError: null,
+            createdAt: new Date(), 
+            updatedAt: new Date()
         };
 
         const result = await db.collection('accounts').insertOne(newAccount);
@@ -342,14 +364,30 @@ app.post('/api/accounts', async (req, res) => {
             accountId: result.insertedId 
         });
     } catch (error) {
-        console.error('Error adding account:', error);
+        console.error('Error adding account:', error.message);
+        
         if (error.code === 11000) {
             return res.status(409).json({ message: "An account with this email already exists." });
         }
-        // ★★★ FIX 2: GUIDE USER TO USE APP PASSWORD ★★★
-        if (error.message.includes("authentication method") || error.message.includes("credentials")) {
-            return res.status(400).json({ message: "Connection failed. Your email provider may require an 'App Password' instead of your regular password. Please generate one in your account's security settings and try again." });
+        
+        // ★★★ FIX 2: MORE SPECIFIC ERROR HANDLING FOR APP PASSWORDS ★★★
+        const errorMessage = error.message.toLowerCase();
+        
+        if (errorMessage.includes('invalid credentials') || 
+            errorMessage.includes('authentication failed') ||
+            errorMessage.includes('login failed') ||
+            errorMessage.includes('[authenticationfailed]')) {
+            return res.status(400).json({ 
+                message: "Authentication failed. Please check your credentials. If using Gmail, Yahoo, or Outlook, you may need to use an 'App Password' instead of your regular password. Generate one in your account's security settings and try again." 
+            });
         }
+        
+        if (errorMessage.includes('connection') || errorMessage.includes('timeout')) {
+            return res.status(400).json({ 
+                message: "Connection failed. Please check the server settings (host and port) and try again." 
+            });
+        }
+        
         res.status(400).json({ message: `Connection failed: ${error.message}` });
     }
 });
@@ -422,18 +460,42 @@ app.post('/api/sync/resume/:jobId', (req, res) => {
     }
 });
 
+// ★★★ FIX 3: ADD MISSING /api/status ENDPOINT FOR JOB STATUS ★★★
+app.get('/api/status', (req, res) => {
+    res.json(Object.values(syncJobs));
+});
+
+// Keep the original sync status endpoint for backward compatibility
 app.get('/api/sync/status', (req, res) => {
     res.json(Object.values(syncJobs));
 });
 
 app.get('/api/emails', async (req, res) => {
     try {
-        const { search, limit = 50, skip = 0 } = req.query;
-        const query = search ? { $text: { $search: search } } : {};
-        const emails = await db.collection('emails').find(query).sort({ receivedAt: -1 }).limit(parseInt(limit)).skip(parseInt(skip)).toArray();
+        const { search, limit = 50, skip = 0, accountId } = req.query;
+        let query = {};
+        
+        // Add account filter if specified
+        if (accountId) {
+            query.accountId = new ObjectId(accountId);
+        }
+        
+        // Add search filter if specified
+        if (search) {
+            query.$text = { $search: search };
+        }
+        
+        const emails = await db.collection('emails')
+            .find(query)
+            .sort({ receivedAt: -1 })
+            .limit(parseInt(limit))
+            .skip(parseInt(skip))
+            .toArray();
+            
         const total = await db.collection('emails').countDocuments(query);
         res.json({ emails, total });
     } catch (error) {
+        console.error('Error fetching emails:', error);
         res.status(500).json({ message: 'Failed to fetch emails' });
     }
 });
@@ -456,15 +518,29 @@ app.get('/api/stats', async (req, res) => {
 async function processAccountEmails(jobId, accountId) {
     const job = syncJobs[jobId];
     if (!job) return;
+    
+    console.log(`Starting email processing for account ${accountId}`);
+    
     try {
         await withConnection(accountId, async (connection) => {
             const boxes = await getSelectableMailboxes(connection);
+            console.log(`Found ${Object.keys(boxes).length} mailboxes to process`);
+            
             for (const boxName of Object.keys(boxes)) {
-                if (job.status !== 'running') return;
+                if (job.status !== 'running') {
+                    console.log(`Job ${jobId} is no longer running, stopping processing`);
+                    return;
+                }
+                
+                console.log(`Processing mailbox: ${boxName}`);
                 job.progress.currentFolder = boxName;
+                
                 await connection.openBox(boxName, true);
                 const messages = await connection.search(['ALL'], { bodies: [''], struct: true });
+                
+                console.log(`Found ${messages.length} messages in ${boxName}`);
                 job.progress.total += messages.length;
+                
                 for (const message of messages) {
                     if (job.status !== 'running') return;
                     await processMessage(message, accountId);
@@ -472,8 +548,13 @@ async function processAccountEmails(jobId, accountId) {
                 }
             }
         });
-        if (job.status === 'running') job.status = 'completed';
+        
+        if (job.status === 'running') {
+            job.status = 'completed';
+            console.log(`✓ Email processing completed for account ${accountId}`);
+        }
     } catch (error) {
+        console.error(`✗ Email processing failed for account ${accountId}:`, error.message);
         job.status = 'failed';
         job.error = error.message;
     }
@@ -516,7 +597,11 @@ async function processMessage(message, accountId) {
             }
         };
         
-        await db.collection('emails').updateOne({ messageId: emailData.messageId }, { $set: emailData }, { upsert: true });
+        await db.collection('emails').updateOne(
+            { messageId: emailData.messageId, accountId: emailData.accountId }, 
+            { $set: emailData }, 
+            { upsert: true }
+        );
     } catch (error) {
         console.error('Error processing individual message:', error);
     }
@@ -599,10 +684,11 @@ MongoClient.connect(mongoUri)
         db = client.db();
         
         await Promise.all([
-            db.collection('emails').createIndex({ messageId: 1 }, { unique: true }),
+            db.collection('emails').createIndex({ messageId: 1, accountId: 1 }, { unique: true }),
             db.collection('emails').createIndex({ from: 1 }),
             db.collection('emails').createIndex({ subject: 'text', body: 'text' }),
             db.collection('emails').createIndex({ receivedAt: -1 }),
+            db.collection('emails').createIndex({ accountId: 1 }),
             db.collection('accounts').createIndex({ user: 1 }, { unique: true })
         ]);
         
