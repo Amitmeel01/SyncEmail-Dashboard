@@ -104,61 +104,66 @@ export default function App() {
         }
     }, []);
     
- const fetchJobStatus = useCallback(async () => {
+const fetchJobStatus = useCallback(async () => {
     try {
-        // Change from /api/sync/status to /api/status to match backend
         const response = await fetch(`${API_URL}/api/status`);
-        if (!response.ok) throw new Error('Failed to fetch jobs');
+        if (!response.ok) throw new Error("Failed to fetch jobs");
         const data = await response.json();
-        console.log("dd",data);
+        console.log("dd", data);
         setJobs(data);
-    } catch (error) { 
+    } catch (error) {
         console.error("Error fetching job statuses:", error);
     }
-}, [emails]);
+}, []); // ✅ no dependency on `emails`
 
-    const fetchEmails = useCallback(async () => {
+const fetchEmails = useCallback(
+    async (showLoader = true) => {
         try {
-            setIsLoading(true);
+            if (showLoader) setIsLoading(true);
             const response = await fetch(`${API_URL}/api/emails?limit=100`);
-            if (!response.ok) throw new Error('Failed to fetch emails');
+            if (!response.ok) throw new Error("Failed to fetch emails");
             const data = await response.json();
             setEmails(data.emails || []);
-        } catch (error) { 
+        } catch (error) {
             console.error("Error fetching emails:", error);
         } finally {
-            setIsLoading(false);
+            if (showLoader) setIsLoading(false);
         }
-    }, []);
+    },
+    [] // ✅ stable
+);
 
-    useEffect(async () => {
-        try {
-            const response = await fetch(`${API_URL}/api/stats`);
-            if (!response.ok) throw new Error('Failed to fetch stats');
-            const data = await response.json();
-            setStats(data);
-        } catch (error) { 
-            console.error("Error fetching stats:", error);
-        }
-    }, [fetchAccounts,fetchEmails]);
-    
-  
-    
-    useEffect(() => {
+const fetchStats = useCallback(async () => {
+    try {
+        const response = await fetch(`${API_URL}/api/stats`);
+        if (!response.ok) throw new Error("Failed to fetch stats");
+        const data = await response.json();
+        setStats(data);
+    } catch (error) {
+        console.error("Error fetching stats:", error);
+    }
+}, []);
+
+// --- Effects ---
+useEffect(() => {
+    // Initial fetch (with loader for emails)
+    fetchAccounts();
+    fetchEmails(true);
+    fetchStats();
+
+    // Background polling (no loader)
+    const intervalId = setInterval(() => {
+        fetchJobStatus();
         fetchAccounts();
-        fetchEmails();
-        // fetchStats();
-        
-        // const intervalId = setInterval(() => {
-        //     fetchJobStatus();
-        //     fetchAccounts();
-        //     if (activeTab === 'dashboard') {
-        //         fetchStats();
-        //     }
-        // }, 3000);
-        
-        // return () => clearInterval(intervalId);
-    }, [fetchAccounts, fetchJobStatus, fetchEmails,  activeTab]);
+        if (activeTab === "dashboard") {
+            fetchStats();
+        }
+        fetchEmails(false); // ✅ refresh silently without flicker
+    }, 3000);
+
+    return () => clearInterval(intervalId);
+}, [activeTab, fetchAccounts, fetchJobStatus, fetchEmails, fetchStats]); // ✅ only depends on stable functions + tab
+
 
     useEffect(() => {
     // Handle OAuth callback messages
