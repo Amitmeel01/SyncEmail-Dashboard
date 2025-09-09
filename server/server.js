@@ -43,6 +43,50 @@ const encrypt = (text) => Buffer.from(text).toString('base64');
 const decrypt = (text) => Buffer.from(text, 'base64').toString('ascii');
 
 // --- ENHANCED IMAP CONNECTION POOL ---
+async function refreshOAuth2Token(account) {
+    try {
+        console.log(`Refreshing OAuth2 token for ${account.user}`);
+        
+        if (!account.refreshToken) {
+            throw new Error('No refresh token available');
+        }
+        
+        oauth2Client.setCredentials({ 
+            refresh_token: account.refreshToken 
+        });
+        
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        
+        if (!credentials.access_token) {
+            throw new Error('Failed to get new access token');
+        }
+        
+        // Update account with new token
+        const updatedAccount = {
+            ...account,
+            accessToken: credentials.access_token,
+            tokenExpiry: new Date(credentials.expiry_date || Date.now() + 3600000) // 1 hour default
+        };
+        
+        await db.collection('accounts').updateOne(
+            { _id: account._id },
+            { 
+                $set: { 
+                    accessToken: credentials.access_token,
+                    tokenExpiry: new Date(credentials.expiry_date || Date.now() + 3600000)
+                }
+            }
+        );
+        
+        console.log(`✓ Token refreshed successfully for ${account.user}`);
+        return updatedAccount;
+        
+    } catch (error) {
+        console.error(`✗ Failed to refresh token for ${account.user}:`, error.message);
+        throw new Error(`Token refresh failed: ${error.message}`);
+    }
+}
+
 function createPoolForAccount(account) {
     if (connectionPools.has(account._id.toString())) {
         return connectionPools.get(account._id.toString());
@@ -52,27 +96,25 @@ function createPoolForAccount(account) {
         create: async () => {
             console.log(`Creating connection for ${account.user}`);
             
-            // Refresh OAuth2 token if needed
-            if (account.authType === 'XOAUTH2' && new Date() >= new Date(account.tokenExpiry)) {
-                console.log(`Refreshing OAuth2 token for ${account.user}`);
-                oauth2Client.setCredentials({ refresh_token: account.refreshToken });
-                try {
-                    const { credentials } = await oauth2Client.refreshAccessToken();
-                    account.accessToken = credentials.access_token;
-                    account.tokenExpiry = new Date(credentials.expiry_date);
-                    
-                    await db.collection('accounts').updateOne(
-                        { _id: account._id },
-                        { 
-                            $set: { 
-                                accessToken: credentials.access_token,
-                                tokenExpiry: new Date(credentials.expiry_date)
-                            }
-                        }
-                    );
-                } catch (error) {
-                    console.error(`Failed to refresh token for ${account.user}:`, error);
-                    throw error;
+            // For OAuth2 accounts, ensure token is valid
+            if (account.authType === 'XOAUTH2') {
+                // Check if token needs refresh (refresh 5 minutes before expiry)
+                const now = new Date();
+                const tokenExpiry = new Date(account.tokenExpiry);
+                const refreshThreshold = new Date(tokenExpiry.getTime() - 5 * 60 * 1000); // 5 minutes before expiry
+                
+                if (now >= refreshThreshold) {
+                    try {
+                        account = await refreshOAuth2Token(account);
+                    } catch (error) {
+                        console.error(`Cannot refresh token for ${account.user}, marking account as invalid`);
+                        // Mark account as having authentication issues
+                        await db.collection('accounts').updateOne(
+                            { _id: account._id },
+                            { $set: { authStatus: 'invalid', lastError: error.message, updatedAt: new Date() } }
+                        );
+                        throw error;
+                    }
                 }
             }
 
@@ -81,8 +123,8 @@ function createPoolForAccount(account) {
                     host: account.host,
                     port: account.port,
                     tls: true,
-                    authTimeout: 15000,
-                    connTimeout: 15000,
+                    authTimeout: 30000,
+                    connTimeout: 30000,
                     tlsOptions: { 
                         rejectUnauthorized: false,
                         servername: account.host
@@ -91,6 +133,9 @@ function createPoolForAccount(account) {
             };
 
             if (account.authType === 'XOAUTH2') {
+                if (!account.accessToken) {
+                    throw new Error('No access token available for OAuth2 authentication');
+                }
                 config.imap.xoauth2 = account.accessToken;
                 config.imap.user = account.user;
             } else {
@@ -100,17 +145,33 @@ function createPoolForAccount(account) {
 
             try {
                 const connection = await imaps.connect(config);
+                
+                // Mark account as working
+                await db.collection('accounts').updateOne(
+                    { _id: account._id },
+                    { $set: { authStatus: 'valid', lastError: null, updatedAt: new Date() } }
+                );
+                
                 console.log(`✓ Connection established for ${account.user}`);
                 return connection;
+                
             } catch (error) {
                 console.error(`✗ Failed to create connection for ${account.user}:`, error.message);
+                
+                // Mark account as having issues
+                await db.collection('accounts').updateOne(
+                    { _id: account._id },
+                    { $set: { authStatus: 'error', lastError: error.message, updatedAt: new Date() } }
+                );
+                
                 throw error;
             }
         },
-        destroy: (connection) => {
+        destroy: async (connection) => {
             try {
-                console.log(`Destroying connection for ${account.user}`);
-                connection.end();
+                if (connection && typeof connection.end === 'function') {
+                    connection.end();
+                }
             } catch (error) {
                 console.error('Error destroying connection:', error);
             }
@@ -118,35 +179,70 @@ function createPoolForAccount(account) {
     };
 
     const pool = genericPool.createPool(factory, {
-        min: 1,
-        max: 5,
-        acquireTimeoutMillis: 30000,
-        createTimeoutMillis: 30000,
+        min: 0, // Don't maintain minimum connections for problematic accounts
+        max: 2, // Reduced max to avoid overwhelming server
+        acquireTimeoutMillis: 45000,
+        createTimeoutMillis: 45000,
         destroyTimeoutMillis: 5000,
         idleTimeoutMillis: 300000,
         reapIntervalMillis: 1000,
-        autostart: false
+        autostart: false,
+        // Add validation to check if connections are still valid
+        testOnBorrow: true
+    });
+
+    // Add error handling for the pool
+    pool.on('factoryCreateError', (err) => {
+        console.error(`Pool factory error for account ${account._id}:`, err.message);
+    });
+
+    pool.on('factoryDestroyError', (err) => {
+        console.error(`Pool destroy error for account ${account._id}:`, err.message);
     });
 
     connectionPools.set(account._id.toString(), pool);
     return pool;
 }
 
-async function withConnection(accountId, callback) {
-    const account = await db.collection('accounts').findOne({ _id: new ObjectId(accountId) });
-    if (!account) throw new Error("Account not found");
 
-    const pool = createPoolForAccount(account);
-    let connection;
+async function withConnection(accountId, callback, maxRetries = 1) {
+    let lastError;
     
-    try {
-        connection = await pool.acquire();
-        return await callback(connection);
-    } finally {
-        if (connection) {
-            pool.release(connection);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const account = await db.collection('accounts').findOne({ _id: new ObjectId(accountId) });
+            if (!account) throw new Error("Account not found");
+
+            // Check if account is marked as invalid
+            if (account.authStatus === 'invalid') {
+                throw new Error(`Account ${account.user} has invalid authentication. Please re-authenticate.`);
+            }
+
+            const pool = createPoolForAccount(account);
+            let connection;
+            
+            try {
+                connection = await pool.acquire();
+                return await callback(connection);
+            } finally {
+                if (connection) {
+                    pool.release(connection);
+                }
+            }
+        } catch (error) {
+            lastError = error;
+            console.error(`Connection attempt ${attempt + 1} failed:`, error.message);
+            
+            if (attempt === maxRetries) {
+                throw error;
+            }
+            
+            // Wait before retry
+            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
         }
     }
+    
+    throw lastError;
 }
 
 // --- EMAIL ANALYTICS FUNCTIONS ---
@@ -249,10 +345,9 @@ app.get('/api/auth/google', (req, res) => {
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
-    const { code } = req.query;
-    const frontendUrl = "https://sync-email-dashboard.vercel.app/"; // Your frontend URL
+    const { code, state } = req.query; // state contains accountId for re-auth
+    const frontendUrl = "https://sync-email-dashboard.vercel.app/";
 
-    // Handle the case where the user denies access
     if (req.query.error) {
         console.error('Google Auth Error:', req.query.error);
         return res.redirect(`${frontendUrl}?error=auth_denied`);
@@ -263,11 +358,9 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
 
     try {
-        // Exchange the authorization code for tokens
         const { tokens } = await oauth2Client.getToken(code);
         oauth2Client.setCredentials(tokens);
 
-        // Get the user's email address
         const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
         const profile = await gmail.users.getProfile({ userId: 'me' });
         const userEmail = profile.data.emailAddress;
@@ -276,36 +369,42 @@ app.get('/api/auth/google/callback', async (req, res) => {
             return res.redirect(`${frontendUrl}?error=email_not_found`);
         }
 
-        // Prepare account data for the database
         const accountData = {
             host: 'imap.gmail.com',
             port: 993,
             user: userEmail,
             authType: 'XOAUTH2',
-            refreshToken: tokens.refresh_token, // IMPORTANT: refresh_token is only sent the first time
+            refreshToken: tokens.refresh_token,
             accessToken: tokens.access_token,
             tokenExpiry: new Date(tokens.expiry_date),
+            authStatus: 'valid',
+            lastError: null,
             password: null,
             updatedAt: new Date()
         };
 
-        // Save or update the account in your database
-        await db.collection('accounts').updateOne(
-            { user: userEmail },
-            { 
-                $set: accountData, 
-                $setOnInsert: { createdAt: new Date() } 
-            },
-            { upsert: true }
-        );
+        if (state) {
+            // This is a re-authentication for existing account
+            await db.collection('accounts').updateOne(
+                { _id: new ObjectId(state) },
+                { $set: accountData }
+            );
+        } else {
+            // New account
+            await db.collection('accounts').updateOne(
+                { user: userEmail },
+                { 
+                    $set: accountData, 
+                    $setOnInsert: { createdAt: new Date() } 
+                },
+                { upsert: true }
+            );
+        }
 
-        // Redirect to frontend on success
         res.redirect(`${frontendUrl}?success=true`);
 
     } catch (error) {
-        console.error('Error during Google OAuth callback:', error.response ? error.response.data : error.message);
-        
-        // Redirect to frontend with a specific error message
+        console.error('Error during Google OAuth callback:', error);
         const errorMessage = error.response?.data?.error || 'authentication_failed';
         res.redirect(`${frontendUrl}?error=${errorMessage}`);
     }
@@ -356,6 +455,55 @@ app.post('/api/accounts', async (req, res) => {
         }
     }
 });
+
+app.post('/api/accounts/:accountId/reauth', async (req, res) => {
+    const { accountId } = req.params;
+    
+    try {
+        const account = await db.collection('accounts').findOne({ _id: new ObjectId(accountId) });
+        if (!account) {
+            return res.status(404).json({ message: 'Account not found' });
+        }
+
+        if (account.authType === 'XOAUTH2') {
+            // For OAuth2, redirect to re-authentication
+            const url = oauth2Client.generateAuthUrl({
+                access_type: 'offline',
+                prompt: 'consent',
+                scope: ['https://mail.google.com/'],
+                state: accountId // Pass account ID to identify which account to update
+            });
+            res.json({ authUrl: url });
+        } else {
+            // For regular accounts, test connection
+            const testConfig = {
+                imap: {
+                    host: account.host,
+                    port: account.port,
+                    tls: true,
+                    authTimeout: 10000,
+                    user: account.user,
+                    password: decrypt(account.password),
+                    tlsOptions: { rejectUnauthorized: false }
+                }
+            };
+            
+            const testConnection = await imaps.connect(testConfig);
+            testConnection.end();
+
+            await db.collection('accounts').updateOne(
+                { _id: account._id },
+                { $set: { authStatus: 'valid', lastError: null, updatedAt: new Date() } }
+            );
+
+            res.json({ message: 'Account authentication verified' });
+        }
+    } catch (error) {
+        console.error('Error during re-authentication:', error);
+        res.status(500).json({ message: `Re-authentication failed: ${error.message}` });
+    }
+});
+
 
 app.get('/api/accounts', async (req, res) => {
     try {
