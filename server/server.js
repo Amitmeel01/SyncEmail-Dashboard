@@ -821,10 +821,11 @@ app.get('/api/emails', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
     try {
         const { accountId } = req.query;
-        console.log("Acc",accountId);
+        console.log("AccountId received:", accountId); // FIXED: Better logging
+        
         let matchStage = {};
         
-        if (accountId) {
+        if (accountId && ObjectId.isValid(accountId)) { // FIXED: Validate ObjectId
             matchStage.accountId = new ObjectId(accountId);
         }
         
@@ -914,8 +915,10 @@ async function processAccountEmails(jobId, accountId) {
                 
                 try {
                     await connection.openBox(boxName, true);
+                    
+                    // FIXED: Get complete message headers including Message-ID
                     const messages = await connection.search(['ALL'], { 
-                        bodies: ['HEADER', 'TEXT'], 
+                        bodies: 'HEADER.FIELDS (MESSAGE-ID FROM TO CC BCC SUBJECT DATE)',
                         struct: true 
                     });
                     
@@ -929,14 +932,13 @@ async function processAccountEmails(jobId, accountId) {
                         }
                         
                         try {
-                            await processMessage(message, accountId);
+                            await processMessage(message, accountId, boxName);
                             job.progress.processed++;
                         } catch (messageError) {
                             console.error(`Error processing message in ${boxName}:`, messageError.message);
                             job.progress.errors = (job.progress.errors || 0) + 1;
                         }
                         
-                        // Add small delay to prevent overwhelming the server
                         await new Promise(resolve => setTimeout(resolve, 10));
                     }
                 } catch (boxError) {
@@ -960,70 +962,78 @@ async function processAccountEmails(jobId, accountId) {
     }
 }
 
-async function processMessage(message, accountId) {
+async function processMessage(message, accountId, folderName = 'INBOX') {
     try {
-        const headerPart = message.parts.find(part => part.which === 'HEADER');
-        const textPart = message.parts.find(part => part.which === 'TEXT');
+        // Get the header part
+        const headerPart = message.parts.find(part => 
+            part.which === 'HEADER.FIELDS (MESSAGE-ID FROM TO CC BCC SUBJECT DATE)'
+        );
         
-        if (!headerPart && !textPart) {
-            console.warn('Message has no processable parts');
+        if (!headerPart || !headerPart.body) {
+            console.warn('Message has no header part, skipping');
             return;
         }
+
+        // Parse just the headers first
+        const parsedHeaders = await simpleParser(headerPart.body + '\r\n\r\n');
         
-        // Combine header and body for parsing
-        const emaildata = headerPart ? headerPart.body : '';
-        const bodyData = textPart ? textPart.body : '';
-        const fullMessage = emaildata + '\r\n\r\n' + bodyData;
-        
-        const parsedMail = await simpleParser(fullMessage);
-        
-        if (!parsedMail.messageId) {
-            console.warn('Message has no messageId, skipping');
-            return;
+        // Generate messageId if missing
+        let messageId = parsedHeaders.messageId;
+        if (!messageId) {
+            // Create a unique messageId using UID and account
+            const uid = message.attributes?.uid || Math.random().toString(36);
+            messageId = `<${uid}.${accountId}.generated@emailsync.local>`;
+            console.log(`Generated messageId: ${messageId} for UID: ${uid}`);
         }
-        
-        const fromAddress = parsedMail.from?.value?.[0]?.address || parsedMail.from?.text || 'unknown';
-        const sendingDomain = fromAddress.includes('@') ? fromAddress.split('@')[1] : 'unknown';
+
+        // Get additional message details
+        const fromAddress = parsedHeaders.from?.value?.[0]?.address || 
+                           parsedHeaders.from?.text || 'unknown';
+        const sendingDomain = fromAddress.includes('@') ? 
+                             fromAddress.split('@')[1] : 'unknown';
         
         // Enhanced analytics
         const [esp, mailServerSecurity] = await Promise.all([
-            detectESP(fromAddress, parsedMail.headers),
+            detectESP(fromAddress, parsedHeaders.headers),
             checkMailServerSecurity(sendingDomain)
         ]);
 
-        const sentDate = parsedMail.date || message.attributes?.date || new Date();
-        const receivedDate = message.attributes?.date || parsedMail.date || new Date();
+        const sentDate = parsedHeaders.date || message.attributes?.date || new Date();
+        const receivedDate = message.attributes?.date || parsedHeaders.date || new Date();
 
         const emailData = {
             accountId: new ObjectId(accountId),
-            messageId: parsedMail.messageId,
+            messageId: messageId,
+            uid: message.attributes?.uid || 0,
+            folder: folderName,
             from: fromAddress,
-            to: parsedMail.to?.text || parsedMail.to?.value?.map(addr => addr.address).join(', ') || '',
-            cc: parsedMail.cc?.text || '',
-            bcc: parsedMail.bcc?.text || '',
-            subject: parsedMail.subject || '(No Subject)',
-            body: parsedMail.text || parsedMail.html || '',
-            htmlBody: parsedMail.html || '',
+            to: parsedHeaders.to?.text || parsedHeaders.to?.value?.map(addr => addr.address).join(', ') || '',
+            cc: parsedHeaders.cc?.text || '',
+            bcc: parsedHeaders.bcc?.text || '',
+            subject: parsedHeaders.subject || '(No Subject)',
+            body: '', // Will be filled when needed
+            htmlBody: '',
             receivedAt: receivedDate,
             sentAt: sentDate,
             flags: message.attributes?.flags || [],
             size: message.attributes?.size || 0,
-            uid: message.attributes?.uid || 0,
             analytics: {
                 sendingDomain,
                 esp,
                 sentReceivedDelta: Math.round((receivedDate.getTime() - sentDate.getTime()) / 1000),
                 mailServerSecurity,
-                hasAttachments: (parsedMail.attachments && parsedMail.attachments.length > 0) || false,
-                attachmentCount: parsedMail.attachments ? parsedMail.attachments.length : 0,
-                wordCount: parsedMail.text ? parsedMail.text.split(/\s+/).length : 0,
-                isHTML: !!parsedMail.html,
-                priority: parsedMail.headers.get('x-priority') || parsedMail.headers.get('priority') || 'normal'
+                hasAttachments: false, // Will be determined later if needed
+                attachmentCount: 0,
+                wordCount: 0,
+                isHTML: false,
+                priority: parsedHeaders.headers?.get('x-priority') || 
+                         parsedHeaders.headers?.get('priority') || 'normal'
             },
             processedAt: new Date()
         };
         
-        await db.collection('emails').updateOne(
+        // Use compound key for uniqueness
+        const result = await db.collection('emails').updateOne(
             { 
                 messageId: emailData.messageId, 
                 accountId: emailData.accountId 
@@ -1035,11 +1045,18 @@ async function processMessage(message, accountId) {
             { upsert: true }
         );
         
+        if (result.upsertedCount > 0) {
+            console.log(`✓ Inserted email: ${emailData.subject} from ${emailData.from}`);
+        } else if (result.modifiedCount > 0) {
+            console.log(`✓ Updated email: ${emailData.subject} from ${emailData.from}`);
+        }
+        
     } catch (error) {
         console.error('Error processing individual message:', error.message);
         throw error;
     }
 }
+
 
 async function processEmailSync(jobId) {
     const job = syncJobs[jobId];
