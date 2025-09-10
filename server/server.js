@@ -1276,5 +1276,4 @@ async function startApplication() {
     }
 }
 
-// Start the application
 startApplication();

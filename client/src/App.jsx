@@ -16,7 +16,6 @@ const GoogleIcon = () => (
     </svg>
 );
 
-// --- Helper Components ---
 const StatusBadge = ({ status, type = 'default' }) => {
     const getStatusColor = () => {
         switch (status) {
@@ -78,7 +77,6 @@ const StatsCard = ({ title, value, subtitle, icon, color = "blue" }) => {
     );
 };
 
-// --- Main App ---
 export default function App() {
     const [accounts, setAccounts] = useState([]);
     const [jobs, setJobs] = useState([]);
@@ -92,7 +90,6 @@ export default function App() {
     
     const API_URL = 'https://syncemail-dashboard.onrender.com';
 
-    // --- API Functions ---
     const fetchAccounts = useCallback(async () => {
         try {
             const response = await fetch(`${API_URL}/api/accounts`);
@@ -114,7 +111,7 @@ const fetchJobStatus = useCallback(async () => {
     } catch (error) {
         console.error("Error fetching job statuses:", error);
     }
-}, []); // ✅ no dependency on `emails`
+}, []); 
 
 const fetchEmails = useCallback(
     async (showLoader = true) => {
@@ -130,7 +127,7 @@ const fetchEmails = useCallback(
             if (showLoader) setIsLoading(false);
         }
     },
-    [] // ✅ stable
+    [] 
 );
 
 const fetchStats = useCallback(async () => {
@@ -145,29 +142,26 @@ const fetchStats = useCallback(async () => {
     }
 }, []);
 
-// --- Effects ---
+
 useEffect(() => {
-    // Initial fetch (with loader for emails)
     fetchAccounts();
     fetchEmails(true);
     fetchStats();
 
-    // Background polling (no loader)
     const intervalId = setInterval(() => {
         fetchJobStatus();
         fetchAccounts();
         if (activeTab === "dashboard") {
             fetchStats();
         }
-        fetchEmails(false); // ✅ refresh silently without flicker
+        fetchEmails(false); 
     }, 3000);
 
     return () => clearInterval(intervalId);
-}, [activeTab, fetchAccounts, fetchJobStatus, fetchEmails, fetchStats]); // ✅ only depends on stable functions + tab
+}, [activeTab, fetchAccounts, fetchJobStatus, fetchEmails, fetchStats]); 
 
 
     useEffect(() => {
-    // Handle OAuth callback messages
     const handleMessage = (event) => {
         if (event.data === 'oauth_success') {
             fetchAccounts();
@@ -176,16 +170,14 @@ useEffect(() => {
     
     window.addEventListener('message', handleMessage);
     
-    // Also check URL parameters for OAuth results
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('auth_success') === 'true') {
         alert('Google authentication successful! Your account has been added.');
         fetchAccounts();
-        // Clean up URL
         window.history.replaceState({}, document.title, window.location.pathname);
     } else if (urlParams.get('error')) {
         alert(`Authentication error: ${decodeURIComponent(urlParams.get('error'))}`);
-        // Clean up URL
+   
         window.history.replaceState({}, document.title, window.location.pathname);
     }
     
@@ -208,7 +200,6 @@ useEffect(() => {
         }
     }, [searchTerm, emails]);
 
-    // --- Event Handlers ---
  const handleAddAccount = async (e) => {
     e.preventDefault();
     setIsLoading(true);
@@ -216,7 +207,6 @@ useEffect(() => {
     const formData = new FormData(e.target);
     const accountData = Object.fromEntries(formData.entries());
     
-    // Fix: Change 'pass' to 'password' to match backend expectation
     if (accountData.pass) {
         accountData.password = accountData.pass;
         delete accountData.pass;
@@ -236,7 +226,6 @@ useEffect(() => {
         setIsModalOpen(false);
         e.target.reset();
         
-        // Show success message
         alert('Account added successfully! You can now process its emails.');
     } catch (err) {
         alert(`Error: ${err.message}`);
@@ -251,7 +240,6 @@ useEffect(() => {
         const popup = window.open(authUrl, '_blank', 'width=500,height=600,noopener,noreferrer');
         setIsModalOpen(false);
         
-        // Poll for popup close to refresh accounts
         const pollTimer = setInterval(() => {
             if (popup.closed) {
                 clearInterval(pollTimer);
@@ -318,10 +306,8 @@ useEffect(() => {
         }
     };
 
-    // --- Render Functions ---
     const renderDashboard = () => (
         <div className="space-y-6">
-            {/* Stats Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <StatsCard 
                     title="Total Emails" 
@@ -353,7 +339,6 @@ useEffect(() => {
                 />
             </div>
 
-            {/* ESP Distribution */}
             {stats.espDistribution && stats.espDistribution.length > 0 && (
                 <div className="bg-white p-6 rounded-lg shadow-md">
                     <h3 className="text-lg font-semibold mb-4 flex items-center">
