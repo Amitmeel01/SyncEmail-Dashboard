@@ -962,57 +962,60 @@ async function processAccountEmails(jobId, accountId) {
     }
 }
 
+
 async function processMessage(message, accountId, folderName = 'INBOX') {
     try {
-        // Get the header part
-        const headerPart = message.parts.find(part => 
-            part.which === 'HEADER.FIELDS (MESSAGE-ID FROM TO CC BCC SUBJECT DATE)'
-        );
+        // Get header and text parts
+        const headerPart = message.parts.find(part => part.which === 'HEADER');
+        const textPart = message.parts.find(part => part.which === 'TEXT');
         
-        if (!headerPart || !headerPart.body) {
-            console.warn('Message has no header part, skipping');
+        if (!headerPart && !textPart) {
+            console.warn('Message has no processable parts, skipping');
             return;
         }
 
-        // Parse just the headers first
-        const parsedHeaders = await simpleParser(headerPart.body + '\r\n\r\n');
+        // Combine header and body for complete parsing
+        const emailData = headerPart ? headerPart.body : '';
+        const bodyData = textPart ? textPart.body : '';
+        const fullMessage = emailData + '\r\n\r\n' + bodyData;
+        
+        const parsedMail = await simpleParser(fullMessage);
         
         // Generate messageId if missing
-        let messageId = parsedHeaders.messageId;
+        let messageId = parsedMail.messageId;
         if (!messageId) {
-            // Create a unique messageId using UID and account
             const uid = message.attributes?.uid || Math.random().toString(36);
             messageId = `<${uid}.${accountId}.generated@emailsync.local>`;
             console.log(`Generated messageId: ${messageId} for UID: ${uid}`);
         }
 
-        // Get additional message details
-        const fromAddress = parsedHeaders.from?.value?.[0]?.address || 
-                           parsedHeaders.from?.text || 'unknown';
+        // Extract proper email addresses
+        const fromAddress = parsedMail.from?.value?.[0]?.address || 
+                           parsedMail.from?.text || 'unknown@unknown.com';
         const sendingDomain = fromAddress.includes('@') ? 
-                             fromAddress.split('@')[1] : 'unknown';
+                             fromAddress.split('@')[1] : 'unknown.com';
         
         // Enhanced analytics
         const [esp, mailServerSecurity] = await Promise.all([
-            detectESP(fromAddress, parsedHeaders.headers),
+            detectESP(fromAddress, parsedMail.headers),
             checkMailServerSecurity(sendingDomain)
         ]);
 
-        const sentDate = parsedHeaders.date || message.attributes?.date || new Date();
-        const receivedDate = message.attributes?.date || parsedHeaders.date || new Date();
+        const sentDate = parsedMail.date || message.attributes?.date || new Date();
+        const receivedDate = message.attributes?.date || parsedMail.date || new Date();
 
-        const emailData = {
+        const emailDoc = {
             accountId: new ObjectId(accountId),
             messageId: messageId,
             uid: message.attributes?.uid || 0,
             folder: folderName,
             from: fromAddress,
-            to: parsedHeaders.to?.text || parsedHeaders.to?.value?.map(addr => addr.address).join(', ') || '',
-            cc: parsedHeaders.cc?.text || '',
-            bcc: parsedHeaders.bcc?.text || '',
-            subject: parsedHeaders.subject || '(No Subject)',
-            body: '', // Will be filled when needed
-            htmlBody: '',
+            to: parsedMail.to?.text || parsedMail.to?.value?.map(addr => addr.address).join(', ') || '',
+            cc: parsedMail.cc?.text || '',
+            bcc: parsedMail.bcc?.text || '',
+            subject: parsedMail.subject || '(No Subject)',
+            body: parsedMail.text || '',
+            htmlBody: parsedMail.html || '',
             receivedAt: receivedDate,
             sentAt: sentDate,
             flags: message.attributes?.flags || [],
@@ -1022,12 +1025,12 @@ async function processMessage(message, accountId, folderName = 'INBOX') {
                 esp,
                 sentReceivedDelta: Math.round((receivedDate.getTime() - sentDate.getTime()) / 1000),
                 mailServerSecurity,
-                hasAttachments: false, // Will be determined later if needed
-                attachmentCount: 0,
-                wordCount: 0,
-                isHTML: false,
-                priority: parsedHeaders.headers?.get('x-priority') || 
-                         parsedHeaders.headers?.get('priority') || 'normal'
+                hasAttachments: (parsedMail.attachments && parsedMail.attachments.length > 0) || false,
+                attachmentCount: parsedMail.attachments ? parsedMail.attachments.length : 0,
+                wordCount: parsedMail.text ? parsedMail.text.split(/\s+/).length : 0,
+                isHTML: !!parsedMail.html,
+                priority: parsedMail.headers?.get('x-priority') || 
+                         parsedMail.headers?.get('priority') || 'normal'
             },
             processedAt: new Date()
         };
@@ -1035,20 +1038,20 @@ async function processMessage(message, accountId, folderName = 'INBOX') {
         // Use compound key for uniqueness
         const result = await db.collection('emails').updateOne(
             { 
-                messageId: emailData.messageId, 
-                accountId: emailData.accountId 
+                messageId: emailDoc.messageId, 
+                accountId: emailDoc.accountId 
             }, 
             { 
-                $set: emailData,
+                $set: emailDoc,
                 $setOnInsert: { createdAt: new Date() }
             }, 
             { upsert: true }
         );
         
         if (result.upsertedCount > 0) {
-            console.log(`✓ Inserted email: ${emailData.subject} from ${emailData.from}`);
+            console.log(`✓ Inserted email: ${emailDoc.subject} from ${emailDoc.from}`);
         } else if (result.modifiedCount > 0) {
-            console.log(`✓ Updated email: ${emailData.subject} from ${emailData.from}`);
+            console.log(`✓ Updated email: ${emailDoc.subject} from ${emailDoc.from}`);
         }
         
     } catch (error) {
