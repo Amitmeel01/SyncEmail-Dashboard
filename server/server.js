@@ -894,168 +894,109 @@ app.get('/api/stats', async (req, res) => {
 async function processAccountEmails(jobId, accountId) {
     const job = syncJobs[jobId];
     if (!job) return;
-    
-    console.log(`Starting email processing for account ${accountId} (Job: ${jobId})`);
-    
+
+    console.log(`[Job: ${jobId}] Starting email processing for account ${accountId}`);
+
     try {
         await withConnection(accountId, async (connection) => {
             const boxes = await getSelectableMailboxes(connection);
             const boxNames = Object.keys(boxes);
-            
-            console.log(`Found ${boxNames.length} mailboxes to process for account ${accountId}`);
-            
+            console.log(`[Job: ${jobId}] Found ${boxNames.length} mailboxes to process.`);
+
             for (const boxName of boxNames) {
                 if (job.status !== 'running') {
-                    console.log(`Job ${jobId} is no longer running, stopping processing`);
+                    console.log(`[Job: ${jobId}] Job is no longer running, stopping.`);
                     return;
                 }
-                
-                console.log(`Processing mailbox: ${boxName}`);
+
                 job.progress.currentFolder = boxName;
-                
+                console.log(`[Job: ${jobId}] Processing folder: ${boxName}`);
+
                 try {
-                    await connection.openBox(boxName, true);
-                    
-                    // FIXED: Get complete message headers including Message-ID
-                    const messages = await connection.search(['ALL'], { 
-                        bodies: 'HEADER.FIELDS (MESSAGE-ID FROM TO CC BCC SUBJECT DATE)',
-                        struct: true 
+                    await connection.openBox(boxName, true); // Open box in read-only mode
+
+                    // ★★★ FIX: FETCH THE ENTIRE RAW MESSAGE BODY ★★★
+                    // This is the crucial change. It gets the full content for parsing.
+                    const messages = await connection.search(['ALL'], {
+                        bodies: [''], // Fetch the full, raw email body
+                        struct: true
                     });
-                    
-                    console.log(`Found ${messages.length} messages in ${boxName}`);
+
                     job.progress.total += messages.length;
-                    
+                    console.log(`[Job: ${jobId}] Found ${messages.length} messages in ${boxName}.`);
+
                     for (const message of messages) {
-                        if (job.status !== 'running') {
-                            console.log(`Job ${jobId} paused during processing`);
-                            return;
-                        }
-                        
+                        if (job.status !== 'running') return; // Check status again inside loop
+
                         try {
-                            await processMessage(message, accountId, boxName);
+                            // Pass the full message object to be processed
+                            await processMessage(message, accountId);
                             job.progress.processed++;
                         } catch (messageError) {
-                            console.error(`Error processing message in ${boxName}:`, messageError.message);
+                            console.error(`[Job: ${jobId}] Failed to process a message in ${boxName}:`, messageError.message);
                             job.progress.errors = (job.progress.errors || 0) + 1;
                         }
-                        
-                        await new Promise(resolve => setTimeout(resolve, 10));
                     }
                 } catch (boxError) {
-                    console.error(`Error processing mailbox ${boxName}:`, boxError.message);
+                    console.error(`[Job: ${jobId}] Could not process mailbox ${boxName}:`, boxError.message);
                     job.progress.errors = (job.progress.errors || 0) + 1;
                 }
             }
         });
-        
+
         if (job.status === 'running') {
             job.status = 'completed';
-            job.completedAt = new Date();
-            console.log(`✓ Email processing completed for account ${accountId}`);
+            console.log(`✅ [Job: ${jobId}] Email processing completed for account ${accountId}`);
         }
-        
     } catch (error) {
-        console.error(`✗ Email processing failed for account ${accountId}:`, error.message);
+        console.error(`❌ [Job: ${jobId}] CRITICAL FAILURE during email processing:`, error.message);
         job.status = 'failed';
         job.error = error.message;
-        job.failedAt = new Date();
     }
 }
 
 
-async function processMessage(message, accountId, folderName = 'INBOX') {
+async function processMessage(message, accountId) {
     try {
-        // Get header and text parts
-        const headerPart = message.parts.find(part => part.which === 'HEADER');
-        const textPart = message.parts.find(part => part.which === 'TEXT');
-        
-        if (!headerPart && !textPart) {
-            console.warn('Message has no processable parts, skipping');
+        const allPart = message.parts.find(part => part.which === '');
+        if (!allPart || !allPart.body) {
+            console.warn('Message has no processable body part, skipping.');
             return;
         }
 
-        // Combine header and body for complete parsing
-        const emailData = headerPart ? headerPart.body : '';
-        const bodyData = textPart ? textPart.body : '';
-        const fullMessage = emailData + '\r\n\r\n' + bodyData;
-        
-        const parsedMail = await simpleParser(fullMessage);
-        
-        // Generate messageId if missing
+        const parsedMail = await simpleParser(allPart.body);
+
         let messageId = parsedMail.messageId;
         if (!messageId) {
-            const uid = message.attributes?.uid || Math.random().toString(36);
+            const uid = message.attributes?.uid || Date.now(); // Use timestamp as fallback
             messageId = `<${uid}.${accountId}.generated@emailsync.local>`;
-            console.log(`Generated messageId: ${messageId} for UID: ${uid}`);
         }
 
-        // Extract proper email addresses
-        const fromAddress = parsedMail.from?.value?.[0]?.address || 
-                           parsedMail.from?.text || 'unknown@unknown.com';
-        const sendingDomain = fromAddress.includes('@') ? 
-                             fromAddress.split('@')[1] : 'unknown.com';
+        const fromAddress = parsedMail.from?.value?.[0]?.address || 'unknown@unknown.com';
         
-        // Enhanced analytics
-        const [esp, mailServerSecurity] = await Promise.all([
-            detectESP(fromAddress, parsedMail.headers),
-            checkMailServerSecurity(sendingDomain)
-        ]);
-
-        const sentDate = parsedMail.date || message.attributes?.date || new Date();
-        const receivedDate = message.attributes?.date || parsedMail.date || new Date();
-
         const emailDoc = {
             accountId: new ObjectId(accountId),
             messageId: messageId,
-            uid: message.attributes?.uid || 0,
-            folder: folderName,
             from: fromAddress,
-            to: parsedMail.to?.text || parsedMail.to?.value?.map(addr => addr.address).join(', ') || '',
-            cc: parsedMail.cc?.text || '',
-            bcc: parsedMail.bcc?.text || '',
             subject: parsedMail.subject || '(No Subject)',
             body: parsedMail.text || '',
-            htmlBody: parsedMail.html || '',
-            receivedAt: receivedDate,
-            sentAt: sentDate,
-            flags: message.attributes?.flags || [],
-            size: message.attributes?.size || 0,
-            analytics: {
-                sendingDomain,
-                esp,
-                sentReceivedDelta: Math.round((receivedDate.getTime() - sentDate.getTime()) / 1000),
-                mailServerSecurity,
-                hasAttachments: (parsedMail.attachments && parsedMail.attachments.length > 0) || false,
-                attachmentCount: parsedMail.attachments ? parsedMail.attachments.length : 0,
-                wordCount: parsedMail.text ? parsedMail.text.split(/\s+/).length : 0,
-                isHTML: !!parsedMail.html,
-                priority: parsedMail.headers?.get('x-priority') || 
-                         parsedMail.headers?.get('priority') || 'normal'
-            },
-            processedAt: new Date()
+            receivedAt: parsedMail.date || new Date(),
+            // ... add other fields you need ...
+            createdAt: new Date()
         };
-        
-        // Use compound key for uniqueness
-        const result = await db.collection('emails').updateOne(
-            { 
-                messageId: emailDoc.messageId, 
-                accountId: emailDoc.accountId 
-            }, 
-            { 
-                $set: emailDoc,
-                $setOnInsert: { createdAt: new Date() }
-            }, 
+
+        // 💡 This new log confirms the data before it goes to the database
+        console.log(`📦 Preparing to save email: "${emailDoc.subject}" from ${emailDoc.from}`);
+
+        await db.collection('emails').updateOne(
+            { messageId: emailDoc.messageId, accountId: emailDoc.accountId },
+            { $set: emailDoc },
             { upsert: true }
         );
-        
-        if (result.upsertedCount > 0) {
-            console.log(`✓ Inserted email: ${emailDoc.subject} from ${emailDoc.from}`);
-        } else if (result.modifiedCount > 0) {
-            console.log(`✓ Updated email: ${emailDoc.subject} from ${emailDoc.from}`);
-        }
-        
+
     } catch (error) {
-        console.error('Error processing individual message:', error.message);
+        console.error('Error in processMessage:', error.message);
+        // Re-throw the error so the job handler knows a message failed
         throw error;
     }
 }
