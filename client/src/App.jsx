@@ -138,6 +138,7 @@ const fetchStats = useCallback(async () => {
         const response = await fetch(`${API_URL}/api/stats`);
         if (!response.ok) throw new Error("Failed to fetch stats");
         const data = await response.json();
+        console.log("stt",data)
         setStats(data);
     } catch (error) {
         console.error("Error fetching stats:", error);

@@ -818,75 +818,91 @@ app.get('/api/emails', async (req, res) => {
 });
 
 // Statistics
+// app.get('/api/stats', async (req, res) => {
+//     try {
+//         const { accountId } = req.query;
+//         console.log("Acc",accountId);
+//         let matchStage = {};
+        
+//         if (accountId) {
+//             matchStage.accountId = new ObjectId(accountId);
+//         }
+        
+//         const [
+//             totalEmails,
+//             espStats,
+//             domainStats,
+//             dailyStats,
+//             accountStats
+//         ] = await Promise.all([
+//             db.collection('emails').countDocuments(matchStage),
+            
+//             db.collection('emails').aggregate([
+//                 ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+//                 { $group: { _id: '$analytics.esp', count: { $sum: 1 } } },
+//                 { $sort: { count: -1 } },
+//                 { $limit: 10 }
+//             ]).toArray(),
+            
+//             db.collection('emails').aggregate([
+//                 ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+//                 { $group: { _id: '$analytics.sendingDomain', count: { $sum: 1 } } },
+//                 { $sort: { count: -1 } },
+//                 { $limit: 10 }
+//             ]).toArray(),
+            
+//             db.collection('emails').aggregate([
+//                 ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+//                 {
+//                     $group: {
+//                         _id: {
+//                             $dateToString: { 
+//                                 format: '%Y-%m-%d', 
+//                                 date: '$receivedAt' 
+//                             }
+//                         },
+//                         count: { $sum: 1 }
+//                     }
+//                 },
+//                 { $sort: { _id: -1 } },
+//                 { $limit: 30 }
+//             ]).toArray(),
+            
+//             db.collection('emails').aggregate([
+//                 { $group: { _id: '$accountId', count: { $sum: 1 } } },
+//                 { $sort: { count: -1 } }
+//             ]).toArray()
+//         ]);
+        
+//         res.json({ 
+//             totalEmails,
+//             espDistribution: espStats,
+//             topDomains: domainStats,
+//             dailyEmailCount: dailyStats,
+//             emailsByAccount: accountStats
+//         });
+        
+//     } catch (error) {
+//         console.error('Error fetching statistics:', error);
+//         res.status(500).json({ message: 'Failed to fetch statistics' });
+//     }
+// });
+
 app.get('/api/stats', async (req, res) => {
     try {
-        const { accountId } = req.query;
-        let matchStage = {};
-        
-        if (accountId) {
-            matchStage.accountId = new ObjectId(accountId);
-        }
-        
-        const [
-            totalEmails,
-            espStats,
-            domainStats,
-            dailyStats,
-            accountStats
-        ] = await Promise.all([
-            db.collection('emails').countDocuments(matchStage),
-            
-            db.collection('emails').aggregate([
-                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
-                { $group: { _id: '$analytics.esp', count: { $sum: 1 } } },
-                { $sort: { count: -1 } },
-                { $limit: 10 }
-            ]).toArray(),
-            
-            db.collection('emails').aggregate([
-                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
-                { $group: { _id: '$analytics.sendingDomain', count: { $sum: 1 } } },
-                { $sort: { count: -1 } },
-                { $limit: 10 }
-            ]).toArray(),
-            
-            db.collection('emails').aggregate([
-                ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
-                {
-                    $group: {
-                        _id: {
-                            $dateToString: { 
-                                format: '%Y-%m-%d', 
-                                date: '$receivedAt' 
-                            }
-                        },
-                        count: { $sum: 1 }
-                    }
-                },
-                { $sort: { _id: -1 } },
-                { $limit: 30 }
-            ]).toArray(),
-            
-            db.collection('emails').aggregate([
-                { $group: { _id: '$accountId', count: { $sum: 1 } } },
-                { $sort: { count: -1 } }
-            ]).toArray()
-        ]);
-        
-        res.json({ 
-            totalEmails,
-            espDistribution: espStats,
-            topDomains: domainStats,
-            dailyEmailCount: dailyStats,
-            emailsByAccount: accountStats
-        });
-        
+        const totalEmails = await db.collection('emails').countDocuments();
+        const espDistribution = await db.collection('emails').aggregate([
+            { $group: { _id: '$analytics.esp', count: { $sum: 1 } } }, { $sort: { count: -1 } }, { $limit: 5 }
+        ]).toArray();
+        const domains = await db.collection('emails').aggregate([
+            { $group: { _id: '$analytics.sendingDomain', count: { $sum: 1 } } }, { $sort: { count: -1 } }, { $limit: 5 }
+        ]).toArray();
+        res.json({ totalEmails, espDistribution, domains });
     } catch (error) {
-        console.error('Error fetching statistics:', error);
-        res.status(500).json({ message: 'Failed to fetch statistics' });
+        console.error("Failed to fetch stats:", error);
+        res.status(500).json({ message: "Internal Server Error" });
     }
 });
-
 // --- CORE PROCESSING LOGIC ---
 
 async function processAccountEmails(jobId, accountId) {
